@@ -25,6 +25,11 @@ pub const METHOD_CALL = "call";
 pub const METHOD_QUEUE_EVENT = "queue_event";
 pub const METHOD_SUBSCRIBE = "subscribe";
 pub const METHOD_UNSUBSCRIBE = "unsubscribe";
+pub const METHOD_DESCRIBE = "describe";
+pub const METHOD_SCHEMA = "schema";
+pub const METHOD_TYPE = "type";
+pub const METHOD_TRACE = "trace";
+pub const METHOD_SELF = "self";
 
 pub const Error = error{
     OpenFailed,

@@ -67,6 +67,12 @@ fn runMain() !u8 {
     if (std.mem.eql(u8, cmd, "list")) return try cmdList(&client);
     if (std.mem.eql(u8, cmd, "methods")) return try cmdMethods(&client, rest.items);
     if (std.mem.eql(u8, cmd, "type")) return try cmdType(&client, rest.items);
+    if (std.mem.eql(u8, cmd, "describe")) return try cmdDescribe(&client, rest.items);
+    if (std.mem.eql(u8, cmd, "schema")) return try cmdSchema(&client, rest.items);
+    if (std.mem.eql(u8, cmd, "trace")) return try cmdTrace(&client, rest.items);
+    if (std.mem.eql(u8, cmd, "self")) return try cmdSelf(&client);
+    if (std.mem.eql(u8, cmd, "find")) return try cmdFind(&client, rest.items);
+    if (std.mem.eql(u8, cmd, "methods-like")) return try cmdMethodsLike(&client, rest.items);
 
     std.debug.print("scev: unknown subcommand '{s}'\n", .{cmd});
     printUsage();
@@ -272,6 +278,243 @@ fn cmdType(c: *rpc.Client, rest: [][]const u8) !u8 {
     return 2;
 }
 
+/// `scev describe <peer> [method]` — reflection-derived signatures
+/// for every `@LuaFunction` on a peripheral, grouped by declaring
+/// class. Pretty-printed, not raw JSON: this is the primary "no docs
+/// available" discovery surface.
+///
+/// Second argument narrows to a single method.
+fn cmdDescribe(c: *rpc.Client, rest: [][]const u8) !u8 {
+    if (rest.len < 1) {
+        std.debug.print("usage: scev describe <peer> [method]\n", .{});
+        return 64;
+    }
+    var ctx = ArgsCtx{ .toks = rest };
+    const gen = struct {
+        fn emit(e: *mpack.Encoder, user: ?*anyopaque) anyerror!void {
+            const c2: *ArgsCtx = @ptrCast(@alignCast(user.?));
+            try e.arrayHeader(@intCast(c2.toks.len));
+            for (c2.toks) |tok| try e.str(tok);
+        }
+    };
+    const resp = c.call(rpc.METHOD_DESCRIBE, gen.emit, @ptrCast(&ctx), 10000) catch |e| {
+        std.debug.print("scev: rpc error: {s}\n", .{@errorName(e)});
+        return 1;
+    };
+    if (resp.is_error) {
+        std.debug.print("scev: rpc returned error: {s}\n", .{resp.bytes});
+        return 2;
+    }
+    // The response is a MsgValue.Map — parse it and pretty-print.
+    var dec = mpack.Decoder.init(resp.bytes);
+    printDescribe(&dec) catch {
+        std.debug.print("scev: malformed describe response\n", .{});
+        return 1;
+    };
+    return 0;
+}
+
+/// `scev schema [event | clear]` — observed event argument shapes.
+/// No arg → all events. `clear` resets the learner. Otherwise filters
+/// to one event.
+fn cmdSchema(c: *rpc.Client, rest: [][]const u8) !u8 {
+    var ctx = ArgsCtx{ .toks = rest };
+    const gen = struct {
+        fn emit(e: *mpack.Encoder, user: ?*anyopaque) anyerror!void {
+            const c2: *ArgsCtx = @ptrCast(@alignCast(user.?));
+            try e.arrayHeader(@intCast(c2.toks.len));
+            for (c2.toks) |tok| try e.str(tok);
+        }
+    };
+    const resp = c.call(rpc.METHOD_SCHEMA, gen.emit, @ptrCast(&ctx), 5000) catch |e| {
+        std.debug.print("scev: rpc error: {s}\n", .{@errorName(e)});
+        return 1;
+    };
+    if (resp.is_error) {
+        std.debug.print("scev: rpc returned error: {s}\n", .{resp.bytes});
+        return 2;
+    }
+    // Single-event responses are a map; multi-event is an array of
+    // maps. Peek the first byte's type to decide.
+    var dec = mpack.Decoder.init(resp.bytes);
+    const k = dec.peek() catch {
+        std.debug.print("scev: malformed schema response\n", .{});
+        return 1;
+    };
+    switch (k) {
+        .map => printSchemaEntry(&dec) catch return 1,
+        .array => {
+            const n = dec.readArrayHeader() catch return 1;
+            var i: u32 = 0;
+            while (i < n) : (i += 1) {
+                printSchemaEntry(&dec) catch return 1;
+            }
+        },
+        .nil => {}, // `clear` returns NIL — nothing to print
+        else => printValue(&dec, 0),
+    }
+    return 0;
+}
+
+/// `scev trace [on|off|dump|clear|status]` — dispatch-trace control.
+/// Default subcommand is `dump`.
+fn cmdTrace(c: *rpc.Client, rest: [][]const u8) !u8 {
+    var ctx = ArgsCtx{ .toks = rest };
+    const gen = struct {
+        fn emit(e: *mpack.Encoder, user: ?*anyopaque) anyerror!void {
+            const c2: *ArgsCtx = @ptrCast(@alignCast(user.?));
+            try e.arrayHeader(@intCast(c2.toks.len));
+            for (c2.toks) |tok| try e.str(tok);
+        }
+    };
+    const resp = c.call(rpc.METHOD_TRACE, gen.emit, @ptrCast(&ctx), 5000) catch |e| {
+        std.debug.print("scev: rpc error: {s}\n", .{@errorName(e)});
+        return 1;
+    };
+    if (resp.is_error) {
+        std.debug.print("scev: rpc returned error: {s}\n", .{resp.bytes});
+        return 2;
+    }
+    var dec = mpack.Decoder.init(resp.bytes);
+    const k = dec.peek() catch return 1;
+    switch (k) {
+        .array => {
+            const n = dec.readArrayHeader() catch return 1;
+            var i: u32 = 0;
+            while (i < n) : (i += 1) {
+                printTraceEntry(&dec) catch return 1;
+            }
+        },
+        else => {
+            printValue(&dec, 0);
+            std.debug.print("\n", .{});
+        },
+    }
+    return 0;
+}
+
+/// `scev self` — machine environment info. Does not leak host mod
+/// identity or world location by design.
+fn cmdSelf(c: *rpc.Client) !u8 {
+    return runCall(c, rpc.METHOD_SELF, null, null, 3000);
+}
+
+/// `scev find <type>` — client-side filter over `list`. Prints
+/// peripheral names whose type set contains the requested type.
+fn cmdFind(c: *rpc.Client, rest: [][]const u8) !u8 {
+    if (rest.len < 1) {
+        std.debug.print("usage: scev find <type>\n", .{});
+        return 64;
+    }
+    const want = rest[0];
+    const resp = c.call(rpc.METHOD_LIST, null, null, 5000) catch |e| {
+        std.debug.print("scev: rpc error: {s}\n", .{@errorName(e)});
+        return 1;
+    };
+    if (resp.is_error) {
+        std.debug.print("scev: rpc returned error: {s}\n", .{resp.bytes});
+        return 2;
+    }
+    var dec = mpack.Decoder.init(resp.bytes);
+    const n = dec.readArrayHeader() catch return 1;
+    var i: u32 = 0;
+    var hits: u32 = 0;
+    while (i < n) : (i += 1) {
+        const m = dec.readMapHeader() catch return 1;
+        var peer: []const u8 = "";
+        var matched = false;
+        var j: u32 = 0;
+        while (j < m) : (j += 1) {
+            const key = dec.readStr() catch return 1;
+            if (std.mem.eql(u8, key, "peer")) {
+                peer = dec.readStr() catch return 1;
+            } else if (std.mem.eql(u8, key, "types")) {
+                const tn = dec.readArrayHeader() catch return 1;
+                var tk: u32 = 0;
+                while (tk < tn) : (tk += 1) {
+                    const t = dec.readStr() catch return 1;
+                    if (std.mem.eql(u8, t, want)) matched = true;
+                }
+            } else {
+                dec.skip() catch return 1;
+            }
+        }
+        if (matched) {
+            std.debug.print("{s}\n", .{peer});
+            hits += 1;
+        }
+    }
+    return if (hits == 0) 2 else 0;
+}
+
+/// `scev methods-like <substring>` — fuzzy method search across all
+/// peripherals. Prints `peer:method` for each match. Issues one
+/// `list` + one `methods` per peripheral — fine for dozens, not for
+/// hundreds.
+fn cmdMethodsLike(c: *rpc.Client, rest: [][]const u8) !u8 {
+    if (rest.len < 1) {
+        std.debug.print("usage: scev methods-like <substring>\n", .{});
+        return 64;
+    }
+    const needle = rest[0];
+    const list_resp = c.call(rpc.METHOD_LIST, null, null, 5000) catch |e| {
+        std.debug.print("scev: rpc error: {s}\n", .{@errorName(e)});
+        return 1;
+    };
+    if (list_resp.is_error) {
+        std.debug.print("scev: rpc returned error: {s}\n", .{list_resp.bytes});
+        return 2;
+    }
+    // Collect peer names first (we reuse the decoder buffer per
+    // methods call).
+    var peers_buf: [64][]const u8 = undefined;
+    var peers_n: usize = 0;
+    var list_dec = mpack.Decoder.init(list_resp.bytes);
+    const ln = list_dec.readArrayHeader() catch return 1;
+    var li: u32 = 0;
+    while (li < ln and peers_n < peers_buf.len) : (li += 1) {
+        const m = list_dec.readMapHeader() catch return 1;
+        var j: u32 = 0;
+        while (j < m) : (j += 1) {
+            const key = list_dec.readStr() catch return 1;
+            if (std.mem.eql(u8, key, "peer")) {
+                const p = list_dec.readStr() catch return 1;
+                peers_buf[peers_n] = p;
+                peers_n += 1;
+            } else {
+                list_dec.skip() catch return 1;
+            }
+        }
+    }
+    var hits: u32 = 0;
+    var pi: usize = 0;
+    while (pi < peers_n) : (pi += 1) {
+        const peer = peers_buf[pi];
+        var single = [_][]const u8{peer};
+        var ctx = ArgsCtx{ .toks = &single };
+        const gen = struct {
+            fn emit(e: *mpack.Encoder, user: ?*anyopaque) anyerror!void {
+                const c2: *ArgsCtx = @ptrCast(@alignCast(user.?));
+                try e.arrayHeader(1);
+                try e.str(c2.toks[0]);
+            }
+        };
+        const resp = c.call(rpc.METHOD_METHODS, gen.emit, @ptrCast(&ctx), 5000) catch continue;
+        if (resp.is_error) continue;
+        var mdec = mpack.Decoder.init(resp.bytes);
+        const mn = mdec.readArrayHeader() catch continue;
+        var mi: u32 = 0;
+        while (mi < mn) : (mi += 1) {
+            const name = mdec.readStr() catch break;
+            if (std.mem.indexOf(u8, name, needle) != null) {
+                std.debug.print("{s}:{s}\n", .{ peer, name });
+                hits += 1;
+            }
+        }
+    }
+    return if (hits == 0) 2 else 0;
+}
+
 fn cmdEvents(c: *rpc.Client, rest: [][]const u8) !u8 {
     const max_count: i32 = if (rest.len >= 1) std.fmt.parseInt(i32, rest[0], 10) catch -1 else -1;
 
@@ -328,6 +571,272 @@ fn emitTypedArg(e: *mpack.Encoder, tok: []const u8) !void {
         }
     }
     try e.str(tok);
+}
+
+// ---------------- Structured printers ----------------
+
+/// Pretty-print a `describe` response map. Two shapes:
+///   - full: { peer, type, types, class, groups: { class: [sig, ...] } }
+///   - narrow: { peer, type, types, class, method: sig }
+fn printDescribe(d: *mpack.Decoder) anyerror!void {
+    const m = try d.readMapHeader();
+    var peer: []const u8 = "?";
+    var type_s: []const u8 = "?";
+    var class_s: []const u8 = "?";
+    // We can't random-access a MsgValue map through this streaming
+    // decoder, so we collect into local state during one pass and
+    // defer group-printing until we've read the header keys. Stash
+    // the groups/method payload offset and re-decode from there if
+    // seen — but mpack.Decoder doesn't expose seeking, so we print
+    // inline once we hit them. The header keys come first in our
+    // own encoder's output, so in practice "peer/type/types/class"
+    // arrive before "groups"/"method". Defensive: tolerate any
+    // order by printing a short header when we hit groups/method.
+    var printed_header = false;
+    var k: u32 = 0;
+    while (k < m) : (k += 1) {
+        const key = try d.readStr();
+        if (std.mem.eql(u8, key, "peer")) {
+            peer = try d.readStr();
+        } else if (std.mem.eql(u8, key, "type")) {
+            type_s = try d.readStr();
+        } else if (std.mem.eql(u8, key, "types")) {
+            // swallow
+            const tn = try d.readArrayHeader();
+            var ti: u32 = 0;
+            while (ti < tn) : (ti += 1) _ = try d.readStr();
+        } else if (std.mem.eql(u8, key, "class")) {
+            class_s = try d.readStr();
+        } else if (std.mem.eql(u8, key, "dynamic")) {
+            _ = try d.readBool();
+            // Remote peripheral — flat methods list follows.
+        } else if (std.mem.eql(u8, key, "methods")) {
+            // Remote peripheral fallback: just a name list.
+            if (!printed_header) {
+                std.debug.print("{s} ({s}) [remote]\n", .{ peer, type_s });
+                printed_header = true;
+            }
+            const mn = try d.readArrayHeader();
+            var mi: u32 = 0;
+            while (mi < mn) : (mi += 1) {
+                const name = try d.readStr();
+                std.debug.print("  {s}(...)  [unknown signature — remote peripheral]\n", .{name});
+            }
+        } else if (std.mem.eql(u8, key, "groups")) {
+            if (!printed_header) {
+                std.debug.print("{s} ({s})\n  class: {s}\n", .{ peer, type_s, class_s });
+                printed_header = true;
+            }
+            const gn = try d.readMapHeader();
+            var gi: u32 = 0;
+            while (gi < gn) : (gi += 1) {
+                const group = try d.readStr();
+                std.debug.print("  [{s}]\n", .{group});
+                const arr_n = try d.readArrayHeader();
+                var ai: u32 = 0;
+                while (ai < arr_n) : (ai += 1) try printSignatureRow(d);
+            }
+        } else if (std.mem.eql(u8, key, "method")) {
+            if (!printed_header) {
+                std.debug.print("{s} ({s})\n  class: {s}\n", .{ peer, type_s, class_s });
+                printed_header = true;
+            }
+            try printSignatureRow(d);
+        } else {
+            try d.skip();
+        }
+    }
+}
+
+/// One signature row: `name(p0: type?, p1: type ∈ {a|b}) -> shape [mainThread]`.
+/// Re-derives the row from the structured params/return fields so the
+/// formatting stays consistent even if the host tweaks its
+/// signatureString template.
+fn printSignatureRow(d: *mpack.Decoder) anyerror!void {
+    const m = try d.readMapHeader();
+    var name: []const u8 = "?";
+    var aliases_buf: [4][]const u8 = undefined;
+    var aliases_n: usize = 0;
+    // Stash params while reading; print after the closing paren.
+    const Param = struct {
+        luaType: []const u8 = "?",
+        optional: bool = false,
+        hasEnum: bool = false,
+        enum_buf: [64]u8 = undefined,
+        enum_len: usize = 0,
+    };
+    var params: [16]Param = undefined;
+    var params_n: usize = 0;
+    var return_s: []const u8 = "one";
+    var main_thread = false;
+    var unsafe_flag = false;
+
+    var k: u32 = 0;
+    while (k < m) : (k += 1) {
+        const key = try d.readStr();
+        if (std.mem.eql(u8, key, "name")) {
+            name = try d.readStr();
+        } else if (std.mem.eql(u8, key, "aliases")) {
+            const an = try d.readArrayHeader();
+            var ai: u32 = 0;
+            while (ai < an) : (ai += 1) {
+                const a = try d.readStr();
+                if (aliases_n < aliases_buf.len) {
+                    aliases_buf[aliases_n] = a;
+                    aliases_n += 1;
+                }
+            }
+        } else if (std.mem.eql(u8, key, "params")) {
+            const pn = try d.readArrayHeader();
+            var pi: u32 = 0;
+            while (pi < pn) : (pi += 1) {
+                var p: Param = .{};
+                const pm = try d.readMapHeader();
+                var pk: u32 = 0;
+                while (pk < pm) : (pk += 1) {
+                    const pkey = try d.readStr();
+                    if (std.mem.eql(u8, pkey, "luaType")) {
+                        p.luaType = try d.readStr();
+                    } else if (std.mem.eql(u8, pkey, "optional")) {
+                        p.optional = try d.readBool();
+                    } else if (std.mem.eql(u8, pkey, "enumValues")) {
+                        p.hasEnum = true;
+                        const en = try d.readArrayHeader();
+                        var ei: u32 = 0;
+                        while (ei < en) : (ei += 1) {
+                            const v = try d.readStr();
+                            if (p.enum_len + v.len + 1 < p.enum_buf.len) {
+                                if (ei != 0) {
+                                    p.enum_buf[p.enum_len] = '|';
+                                    p.enum_len += 1;
+                                }
+                                @memcpy(p.enum_buf[p.enum_len .. p.enum_len + v.len], v);
+                                p.enum_len += v.len;
+                            } else {
+                                try d.skip();
+                            }
+                        }
+                    } else {
+                        try d.skip();
+                    }
+                }
+                if (params_n < params.len) {
+                    params[params_n] = p;
+                    params_n += 1;
+                }
+            }
+        } else if (std.mem.eql(u8, key, "return")) {
+            return_s = try d.readStr();
+        } else if (std.mem.eql(u8, key, "mainThread")) {
+            main_thread = try d.readBool();
+        } else if (std.mem.eql(u8, key, "unsafe")) {
+            unsafe_flag = try d.readBool();
+        } else {
+            try d.skip();
+        }
+    }
+
+    std.debug.print("    {s}(", .{name});
+    var pi: usize = 0;
+    while (pi < params_n) : (pi += 1) {
+        if (pi != 0) std.debug.print(", ", .{});
+        const p = params[pi];
+        const opt_marker: []const u8 = if (p.optional) "?" else "";
+        if (p.hasEnum and p.enum_len > 0) {
+            std.debug.print("arg{d}: {s}{s} ∈ {{{s}}}", .{ pi, p.luaType, opt_marker, p.enum_buf[0..p.enum_len] });
+        } else {
+            std.debug.print("arg{d}: {s}{s}", .{ pi, p.luaType, opt_marker });
+        }
+    }
+    std.debug.print("): ", .{});
+    if (std.mem.eql(u8, return_s, "none")) {
+        std.debug.print("nil", .{});
+    } else if (std.mem.eql(u8, return_s, "many")) {
+        std.debug.print("value, ...", .{});
+    } else if (std.mem.eql(u8, return_s, "dynamic")) {
+        std.debug.print("dynamic", .{});
+    } else {
+        std.debug.print("value", .{});
+    }
+    if (main_thread) std.debug.print("  [mainThread]", .{});
+    if (unsafe_flag) std.debug.print("  [unsafe]", .{});
+    if (aliases_n > 0) {
+        std.debug.print("  aliases:", .{});
+        var ai: usize = 0;
+        while (ai < aliases_n) : (ai += 1) std.debug.print(" {s}", .{aliases_buf[ai]});
+    }
+    std.debug.print("\n", .{});
+}
+
+/// One schema entry: `name  N observations\n  shape  count\n...`
+fn printSchemaEntry(d: *mpack.Decoder) anyerror!void {
+    const m = try d.readMapHeader();
+    var name: []const u8 = "?";
+    var observations: i64 = 0;
+    var shape_buf: [32]struct { key: []const u8, count: i64 } = undefined;
+    var shape_n: usize = 0;
+    var k: u32 = 0;
+    while (k < m) : (k += 1) {
+        const key = try d.readStr();
+        if (std.mem.eql(u8, key, "name")) {
+            name = try d.readStr();
+        } else if (std.mem.eql(u8, key, "observations")) {
+            observations = try d.readInt();
+        } else if (std.mem.eql(u8, key, "shapes")) {
+            const sn = try d.readMapHeader();
+            var si: u32 = 0;
+            while (si < sn) : (si += 1) {
+                const sk = try d.readStr();
+                const sv = try d.readInt();
+                if (shape_n < shape_buf.len) {
+                    shape_buf[shape_n] = .{ .key = sk, .count = sv };
+                    shape_n += 1;
+                }
+            }
+        } else {
+            try d.skip();
+        }
+    }
+    std.debug.print("{s}  {d} observation(s)\n", .{ name, observations });
+    var si: usize = 0;
+    while (si < shape_n) : (si += 1) {
+        std.debug.print("  {s}  ×{d}\n", .{ shape_buf[si].key, shape_buf[si].count });
+    }
+}
+
+/// One dispatch-trace row: `[startedAt+us] peer.method(args) → outcome: detail`.
+fn printTraceEntry(d: *mpack.Decoder) anyerror!void {
+    const m = try d.readMapHeader();
+    var peer: []const u8 = "?";
+    var method: []const u8 = "?";
+    var args_s: []const u8 = "";
+    var outcome: []const u8 = "?";
+    var detail: []const u8 = "";
+    var has_detail = false;
+    var started: i64 = 0;
+    var dur_us: i64 = 0;
+    var k: u32 = 0;
+    while (k < m) : (k += 1) {
+        const key = try d.readStr();
+        if (std.mem.eql(u8, key, "peer")) peer = try d.readStr()
+        else if (std.mem.eql(u8, key, "method")) method = try d.readStr()
+        else if (std.mem.eql(u8, key, "args")) args_s = try d.readStr()
+        else if (std.mem.eql(u8, key, "outcome")) outcome = try d.readStr()
+        else if (std.mem.eql(u8, key, "detail")) {
+            const pk = try d.peek();
+            if (pk == .nil) {
+                try d.readNil();
+            } else {
+                detail = try d.readStr();
+                has_detail = true;
+            }
+        } else if (std.mem.eql(u8, key, "startedAt")) started = try d.readInt()
+        else if (std.mem.eql(u8, key, "durationUs")) dur_us = try d.readInt()
+        else try d.skip();
+    }
+    std.debug.print("[{d}+{d}us] {s}.{s}({s}) → {s}", .{ started, dur_us, peer, method, args_s, outcome });
+    if (has_detail) std.debug.print(": {s}", .{detail});
+    std.debug.print("\n", .{});
 }
 
 // ---------------- Result printer ----------------
@@ -426,11 +935,17 @@ fn printUsage() void {
         \\subcommands:
         \\  ping                           liveness check
         \\  log <level> <msg>              log to host (trace|debug|info|warn|error)
+        \\  self                           machine environment info
         \\  list                           list peripherals (CC's peripheral.getNames)
-        \\  type <peripheral>              print a peripheral's type(s)
+        \\  find <type>                    list peripherals by type
+        \\  type <peripheral>              print a peripheral's type(s) and class
         \\  methods <peripheral>           list a peripheral's methods
+        \\  methods-like <substring>       fuzzy-search method names across peripherals
+        \\  describe <peer> [method]       reflection-derived signatures, grouped by class
         \\  call <peripheral> <method> ... call a peripheral method
         \\  events [count]                 subscribe and print events
+        \\  schema [event|clear]           observed event-argument shapes
+        \\  trace [on|off|status|dump|clear]   dispatch-trace control
         \\
         \\argument types (prefix with 't:' where t is):
         \\  s:hello   string (default for bare tokens)

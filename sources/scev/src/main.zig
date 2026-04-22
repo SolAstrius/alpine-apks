@@ -16,8 +16,7 @@
 //!   b:true    bool
 //!   n:        nil
 //!
-//! Zig port of the original C implementation at ../scev-guest/.
-//! Same wire protocol, same flag surface.
+//! Ported from an earlier C implementation; same wire protocol and flag surface.
 
 const std = @import("std");
 const mpack = @import("mpack.zig");

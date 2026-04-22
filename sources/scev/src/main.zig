@@ -65,6 +65,9 @@ fn runMain() !u8 {
     if (std.mem.eql(u8, cmd, "log"))  return try cmdLog(&client, rest.items, alloc);
     if (std.mem.eql(u8, cmd, "call")) return try cmdCall(&client, rest.items);
     if (std.mem.eql(u8, cmd, "events")) return try cmdEvents(&client, rest.items);
+    if (std.mem.eql(u8, cmd, "list")) return try cmdList(&client);
+    if (std.mem.eql(u8, cmd, "methods")) return try cmdMethods(&client, rest.items);
+    if (std.mem.eql(u8, cmd, "type")) return try cmdType(&client, rest.items);
 
     std.debug.print("scev: unknown subcommand '{s}'\n", .{cmd});
     printUsage();
@@ -119,6 +122,155 @@ fn cmdCall(c: *rpc.Client, rest: [][]const u8) !u8 {
         }
     };
     return runCall(c, rpc.METHOD_CALL, gen.emit, @ptrCast(&ctx), 15000);
+}
+
+/// `scev list` — CC's peripheral.getNames(), roughly.
+///
+/// Hits METHOD_LIST which returns an array of `{peer, types}` maps;
+/// prints one line per peripheral in `name  type[+extraType...]`
+/// form so shell-scripting scev is pleasant.
+fn cmdList(c: *rpc.Client) !u8 {
+    const resp = c.call(rpc.METHOD_LIST, null, null, 5000) catch |e| {
+        std.debug.print("scev: rpc error: {s}\n", .{@errorName(e)});
+        return 1;
+    };
+    if (resp.is_error) {
+        std.debug.print("scev: rpc returned error: {s}\n", .{resp.bytes});
+        return 2;
+    }
+    var dec = mpack.Decoder.init(resp.bytes);
+    const n = dec.readArrayHeader() catch {
+        std.debug.print("scev: malformed list response\n", .{});
+        return 1;
+    };
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        // Each entry is a map with keys "peer" and "types"; accept
+        // them in any order rather than hard-coding the insertion
+        // order the host uses today.
+        const m = dec.readMapHeader() catch return 1;
+        var peer: []const u8 = "?";
+        // Buffered printing of types — keep it tiny; nothing past ~8
+        // types is plausible for a CC peripheral and we just need
+        // "name  t1+t2+t3\n".
+        var types_buf: [256]u8 = undefined;
+        var types_pos: usize = 0;
+        var j: u32 = 0;
+        while (j < m) : (j += 1) {
+            const key = dec.readStr() catch return 1;
+            if (std.mem.eql(u8, key, "peer")) {
+                peer = dec.readStr() catch return 1;
+            } else if (std.mem.eql(u8, key, "types")) {
+                const tn = dec.readArrayHeader() catch return 1;
+                var tk: u32 = 0;
+                while (tk < tn) : (tk += 1) {
+                    const t = dec.readStr() catch return 1;
+                    if (tk != 0 and types_pos < types_buf.len) {
+                        types_buf[types_pos] = '+';
+                        types_pos += 1;
+                    }
+                    const copy_n = @min(t.len, types_buf.len - types_pos);
+                    @memcpy(types_buf[types_pos .. types_pos + copy_n], t[0..copy_n]);
+                    types_pos += copy_n;
+                }
+            } else {
+                dec.skip() catch return 1;
+            }
+        }
+        std.debug.print("{s}  {s}\n", .{ peer, types_buf[0..types_pos] });
+    }
+    return 0;
+}
+
+/// `scev methods <peer>` — CC's peripheral.getMethods(name). Prints
+/// each method on its own line.
+fn cmdMethods(c: *rpc.Client, rest: [][]const u8) !u8 {
+    if (rest.len < 1) {
+        std.debug.print("usage: scev methods <peer>\n", .{});
+        return 64;
+    }
+    var ctx = ArgsCtx{ .toks = rest };
+    const gen = struct {
+        fn emit(e: *mpack.Encoder, user: ?*anyopaque) anyerror!void {
+            const c2: *ArgsCtx = @ptrCast(@alignCast(user.?));
+            try e.arrayHeader(1);
+            try e.str(c2.toks[0]);
+        }
+    };
+    const resp = c.call(rpc.METHOD_METHODS, gen.emit, @ptrCast(&ctx), 5000) catch |e| {
+        std.debug.print("scev: rpc error: {s}\n", .{@errorName(e)});
+        return 1;
+    };
+    if (resp.is_error) {
+        std.debug.print("scev: rpc returned error: {s}\n", .{resp.bytes});
+        return 2;
+    }
+    var dec = mpack.Decoder.init(resp.bytes);
+    const n = dec.readArrayHeader() catch return 1;
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        const name = dec.readStr() catch return 1;
+        std.debug.print("{s}\n", .{name});
+    }
+    return 0;
+}
+
+/// `scev type <peer>` — CC's peripheral.getType(name). Currently runs
+/// `scev list` under the hood and filters for the matching name;
+/// could be a dedicated RPC later if the cost shows up.
+fn cmdType(c: *rpc.Client, rest: [][]const u8) !u8 {
+    if (rest.len < 1) {
+        std.debug.print("usage: scev type <peer>\n", .{});
+        return 64;
+    }
+    const want = rest[0];
+    const resp = c.call(rpc.METHOD_LIST, null, null, 5000) catch |e| {
+        std.debug.print("scev: rpc error: {s}\n", .{@errorName(e)});
+        return 1;
+    };
+    if (resp.is_error) {
+        std.debug.print("scev: rpc returned error: {s}\n", .{resp.bytes});
+        return 2;
+    }
+    var dec = mpack.Decoder.init(resp.bytes);
+    const n = dec.readArrayHeader() catch return 1;
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        const m = dec.readMapHeader() catch return 1;
+        var peer: []const u8 = "";
+        var matched = false;
+        var types_buf: [256]u8 = undefined;
+        var types_pos: usize = 0;
+        var j: u32 = 0;
+        while (j < m) : (j += 1) {
+            const key = dec.readStr() catch return 1;
+            if (std.mem.eql(u8, key, "peer")) {
+                peer = dec.readStr() catch return 1;
+                matched = std.mem.eql(u8, peer, want);
+            } else if (std.mem.eql(u8, key, "types")) {
+                const tn = dec.readArrayHeader() catch return 1;
+                var tk: u32 = 0;
+                while (tk < tn) : (tk += 1) {
+                    const t = dec.readStr() catch return 1;
+                    if (tk != 0 and types_pos < types_buf.len) {
+                        types_buf[types_pos] = '\n';
+                        types_pos += 1;
+                    }
+                    const copy_n = @min(t.len, types_buf.len - types_pos);
+                    @memcpy(types_buf[types_pos .. types_pos + copy_n], t[0..copy_n]);
+                    types_pos += copy_n;
+                }
+            } else {
+                dec.skip() catch return 1;
+            }
+        }
+        if (matched) {
+            std.debug.print("{s}\n", .{types_buf[0..types_pos]});
+            return 0;
+        }
+    }
+    std.debug.print("scev: no such peripheral: {s}\n", .{want});
+    return 2;
 }
 
 fn cmdEvents(c: *rpc.Client, rest: [][]const u8) !u8 {
@@ -275,7 +427,10 @@ fn printUsage() void {
         \\subcommands:
         \\  ping                           liveness check
         \\  log <level> <msg>              log to host (trace|debug|info|warn|error)
-        \\  call <peripheral> <method> ... call a CC: Tweaked peripheral
+        \\  list                           list peripherals (CC's peripheral.getNames)
+        \\  type <peripheral>              print a peripheral's type(s)
+        \\  methods <peripheral>           list a peripheral's methods
+        \\  call <peripheral> <method> ... call a peripheral method
         \\  events [count]                 subscribe and print events
         \\
         \\argument types (prefix with 't:' where t is):

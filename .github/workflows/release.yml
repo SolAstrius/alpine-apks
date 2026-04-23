@@ -24,18 +24,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Zig 0.16 isn't in Alpine 3.23's repos; fetch nightly on the runner
-      # and stash it in the workspace so the alpine chroot (which bind-
-      # mounts $GITHUB_WORKSPACE) can exec it.
-      - uses: mlugg/setup-zig@v1
-        with:
-          version: master
-
-      - name: Stage zig into workspace
+      # Zig 0.16 isn't in Alpine 3.23's repos; fetch the upstream static
+      # tarball on the runner and stash it in the workspace so the alpine
+      # chroot (which bind-mounts $GITHUB_WORKSPACE) can exec it. We pull
+      # direct from ziglang.org because mlugg/setup-zig still expects
+      # the pre-0.16 `zig-linux-x86_64-*` tarball naming.
+      - name: Stage Zig 0.16.0 into workspace
+        env:
+          ZIG_VERSION: 0.16.0
         run: |
-          set -eu
-          zig_root="$(dirname "$(command -v zig)")"
-          cp -r "$zig_root" "$GITHUB_WORKSPACE/.zig"
+          set -euo pipefail
+          url="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          curl -fsSL "$url" | tar -xJ -C "$GITHUB_WORKSPACE"
+          mv "$GITHUB_WORKSPACE/zig-x86_64-linux-${ZIG_VERSION}" "$GITHUB_WORKSPACE/.zig"
+          "$GITHUB_WORKSPACE/.zig/zig" version
 
       - uses: jirutka/setup-alpine@v1
         with:

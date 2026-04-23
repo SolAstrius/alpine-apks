@@ -126,12 +126,6 @@ jobs:
           install -d -m 700 "$HOME/.abuild"
           printf '%s' "$ABUILD_PRIVKEY" > "$HOME/.abuild/$SIGNING_KEY_NAME"
           chmod 600 "$HOME/.abuild/$SIGNING_KEY_NAME"
-          # Debug: fingerprint the loaded privkey's derived pubkey so we
-          # can confirm the secret arrived intact (public info, safe to log).
-          echo "DEBUG: derived pubkey sha256:"
-          openssl rsa -in "$HOME/.abuild/$SIGNING_KEY_NAME" -pubout 2>/dev/null | openssl sha256
-          echo "DEBUG: committed pubkey sha256:"
-          openssl sha256 "$GITHUB_WORKSPACE/keys/$SIGNING_KEY_NAME.pub"
           # apk index reads input .apks and verifies signatures against
           # keys it trusts — drop ours in before calling it.
           sudo install -D -m 644 \

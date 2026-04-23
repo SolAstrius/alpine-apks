@@ -9,20 +9,17 @@ arch="x86_64 riscv64"
 license="MPL-2.0"
 makedepends="zig"
 options="!check !tracedeps"
-builddir="$srcdir/$pkgname-$pkgver"
 
 # In-tree source: the Zig tree lives at ../../sources/scev in this
 # monorepo. We skip abuild's fetch/source= machinery and copy the
-# tree in directly. Bump pkgver or pkgrel to force a rebuild.
+# tree into the default $builddir ("$srcdir/$pkgname-$pkgver").
+# Bump pkgver or pkgrel to force a rebuild.
 unpack() {
 	mkdir -p "$builddir"
 	cp -a "$startdir/../../sources/$pkgname/." "$builddir/"
 }
 
-prepare() { :; }
-
 build() {
-	cd "$builddir"
 	case "$CARCH" in
 		x86_64)  zigtarget="x86_64-linux-musl"  ;;
 		riscv64) zigtarget="riscv64-linux-musl" ;;

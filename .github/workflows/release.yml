@@ -59,10 +59,14 @@ jobs:
           install -d -m 700 "$HOME/.abuild"
           printf '%s' "$ABUILD_PRIVKEY" > "$HOME/.abuild/$SIGNING_KEY_NAME"
           chmod 600 "$HOME/.abuild/$SIGNING_KEY_NAME"
+          # abuild-sign expects the matching .pub alongside the private key.
+          install -m 644 \
+            "$GITHUB_WORKSPACE/keys/$SIGNING_KEY_NAME.pub" \
+            "$HOME/.abuild/$SIGNING_KEY_NAME.pub"
           echo "PACKAGER_PRIVKEY=\"$HOME/.abuild/$SIGNING_KEY_NAME\"" > "$HOME/.abuild/abuild.conf"
 
-          # Install the public key into /etc/apk/keys so abuild-sign can
-          # reference it when emitting .apk signatures.
+          # Also install the public key into /etc/apk/keys so apk accepts
+          # the signatures on any subsequent verification step.
           sudo install -D -m 644 \
             "$GITHUB_WORKSPACE/keys/$SIGNING_KEY_NAME.pub" \
             "/etc/apk/keys/$SIGNING_KEY_NAME.pub"
@@ -134,6 +138,9 @@ jobs:
           install -d -m 700 "$HOME/.abuild"
           printf '%s' "$ABUILD_PRIVKEY" > "$HOME/.abuild/$SIGNING_KEY_NAME"
           chmod 600 "$HOME/.abuild/$SIGNING_KEY_NAME"
+          install -m 644 \
+            "$GITHUB_WORKSPACE/keys/$SIGNING_KEY_NAME.pub" \
+            "$HOME/.abuild/$SIGNING_KEY_NAME.pub"
 
           cd "$GITHUB_WORKSPACE/pages"
           for art in "$GITHUB_WORKSPACE"/artifacts/apks-*/alpine/"$ALPINE_BRANCH"/"$REPO_NAME"/*/; do

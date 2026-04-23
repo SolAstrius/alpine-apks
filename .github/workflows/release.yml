@@ -24,10 +24,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Zig 0.16 isn't in Alpine 3.23's repos; fetch nightly on the runner
+      # and stash it in the workspace so the alpine chroot (which bind-
+      # mounts $GITHUB_WORKSPACE) can exec it.
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: master
+
+      - name: Stage zig into workspace
+        run: |
+          set -eu
+          zig_root="$(dirname "$(command -v zig)")"
+          cp -r "$zig_root" "$GITHUB_WORKSPACE/.zig"
+
       - uses: jirutka/setup-alpine@v1
         with:
           branch: ${{ env.ALPINE_BRANCH }}
-          packages: alpine-sdk zig sudo
+          packages: alpine-sdk sudo
 
       - name: Build packages
         shell: alpine.sh {0}
@@ -36,6 +49,9 @@ jobs:
           ABUILD_PRIVKEY: ${{ secrets.ABUILD_PRIVKEY }}
         run: |
           set -eu
+          export PATH="$GITHUB_WORKSPACE/.zig:$PATH"
+          zig version
+
           # abuild refuses to run as root — set up keys under the runner
           # user's HOME which setup-alpine drops us into.
           install -d -m 700 "$HOME/.abuild"
@@ -52,7 +68,7 @@ jobs:
           for pkg in main/*/; do
             name=$(basename "$pkg")
             echo "::group::abuild $name ($CARCH)"
-            ( cd "$pkg" && CARCH="$CARCH" abuild -F )
+            ( cd "$pkg" && CARCH="$CARCH" PATH="$GITHUB_WORKSPACE/.zig:$PATH" abuild -F )
             echo "::endgroup::"
           done
 

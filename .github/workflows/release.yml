@@ -6,7 +6,9 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+  pages: write
+  id-token: write
 
 env:
   ALPINE_BRANCH: v3.23
@@ -97,28 +99,14 @@ jobs:
           path: out/
 
   publish:
-    name: publish to gh-pages
+    name: publish Pages
     needs: build
     runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/checkout@v4
-        with:
-          ref: gh-pages
-          path: pages
-        continue-on-error: true
-
-      - name: Bootstrap gh-pages if missing
-        run: |
-          set -eu
-          if [ ! -d pages/.git ]; then
-            rm -rf pages
-            mkdir pages
-            cd pages
-            git init -b gh-pages
-            git remote add origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
-          fi
 
       - uses: actions/download-artifact@v4
         with:
@@ -127,9 +115,9 @@ jobs:
       - uses: jirutka/setup-alpine@v1
         with:
           branch: ${{ env.ALPINE_BRANCH }}
-          packages: alpine-sdk apk-tools sudo
+          packages: alpine-sdk apk-tools
 
-      - name: Merge APKs and regenerate signed APKINDEX
+      - name: Stage + sign APKINDEX
         shell: alpine.sh {0}
         env:
           ABUILD_PRIVKEY: ${{ secrets.ABUILD_PRIVKEY }}
@@ -138,42 +126,30 @@ jobs:
           install -d -m 700 "$HOME/.abuild"
           printf '%s' "$ABUILD_PRIVKEY" > "$HOME/.abuild/$SIGNING_KEY_NAME"
           chmod 600 "$HOME/.abuild/$SIGNING_KEY_NAME"
-          install -m 644 \
-            "$GITHUB_WORKSPACE/keys/$SIGNING_KEY_NAME.pub" \
-            "$HOME/.abuild/$SIGNING_KEY_NAME.pub"
 
-          cd "$GITHUB_WORKSPACE/pages"
+          site="$GITHUB_WORKSPACE/site"
+          mkdir -p "$site"
           for art in "$GITHUB_WORKSPACE"/artifacts/apks-*/alpine/"$ALPINE_BRANCH"/"$REPO_NAME"/*/; do
             [ -d "$art" ] || continue
             arch=$(basename "$art")
-            dest="alpine/$ALPINE_BRANCH/$REPO_NAME/$arch"
+            dest="$site/alpine/$ALPINE_BRANCH/$REPO_NAME/$arch"
             mkdir -p "$dest"
             cp -f "$art"/*.apk "$dest/"
-          done
-
-          install -D -m 644 "$GITHUB_WORKSPACE/keys/$SIGNING_KEY_NAME.pub" "keys/$SIGNING_KEY_NAME.pub"
-
-          for d in alpine/"$ALPINE_BRANCH"/"$REPO_NAME"/*/; do
-            ( cd "$d"
+            ( cd "$dest"
               apk index -o APKINDEX.tar.gz.unsigned *.apk
               abuild-sign -k "$HOME/.abuild/$SIGNING_KEY_NAME" APKINDEX.tar.gz.unsigned
               mv APKINDEX.tar.gz.unsigned APKINDEX.tar.gz
             )
           done
 
-      - name: Publish
-        working-directory: pages
-        run: |
-          set -eu
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout -B gh-pages
-          git add -A
-          if git diff --cached --quiet; then
-            echo "no changes"
-            exit 0
-          fi
-          git commit -m "publish: ${GITHUB_SHA::7} ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
-          git remote | grep -q '^origin$' || git remote add origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
-          git remote set-url origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
-          git push -u origin gh-pages
+          # Publish the public key at a stable URL consumers can curl.
+          install -D -m 644 "$GITHUB_WORKSPACE/keys/$SIGNING_KEY_NAME.pub" "$site/keys/$SIGNING_KEY_NAME.pub"
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - id: deploy
+        uses: actions/deploy-pages@v4

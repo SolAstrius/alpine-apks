@@ -24,25 +24,25 @@ const rpc = @import("rpc.zig");
 
 const SCEV_VERSION = "0.1-zig";
 
-pub fn main() u8 {
-    return runMain() catch |e| {
+pub fn main(init: std.process.Init.Minimal) u8 {
+    return runMain(init) catch |e| {
         std.debug.print("scev: unhandled error: {s}\n", .{@errorName(e)});
         return 1;
     };
 }
 
-fn runMain() !u8 {
-    var args_it = std.process.args();
-    defer args_it.deinit();
+fn runMain(init: std.process.Init.Minimal) !u8 {
+    // POSIX Iterator.init needs no allocator and no deinit — the args
+    // vector is already laid out in process memory by the loader.
+    var args_it = std.process.Args.Iterator.init(init.args);
     _ = args_it.next() orelse return exitUsage();
 
     const cmd = args_it.next() orelse return exitUsage();
 
     // Slurp the rest of argv into a slice so subcommands can index it.
-    var rest = std.ArrayListUnmanaged([]const u8){};
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const alloc = gpa.allocator();
+    // We link libc, so the C allocator is the cheapest real allocator.
+    const alloc = std.heap.c_allocator;
+    var rest: std.ArrayList([]const u8) = .empty;
     defer rest.deinit(alloc);
     while (args_it.next()) |a| try rest.append(alloc, a);
 
@@ -51,7 +51,9 @@ fn runMain() !u8 {
         return 0;
     }
 
-    const serial_path: ?[]const u8 = std.posix.getenv("SCEV_SERIAL");
+    // std.c.getenv returns ?[*:0]const u8; span() gives us the slice.
+    const serial_env = std.c.getenv("SCEV_SERIAL");
+    const serial_path: ?[]const u8 = if (serial_env) |p| std.mem.span(p) else null;
     var client = rpc.Client.open(serial_path) catch |e| {
         std.debug.print("scev: cannot open {s}: {s}\n", .{
             serial_path orelse "/dev/ttyS1", @errorName(e),
@@ -92,7 +94,7 @@ fn cmdLog(c: *rpc.Client, rest: [][]const u8, alloc: std.mem.Allocator) !u8 {
     }
     const level = rest[0];
     // Join all remaining tokens with single spaces for ergonomic CLI.
-    var msg_buf = std.ArrayListUnmanaged(u8){};
+    var msg_buf: std.ArrayList(u8) = .empty;
     defer msg_buf.deinit(alloc);
     for (rest[1..], 0..) |tok, i| {
         if (i != 0) try msg_buf.append(alloc, ' ');

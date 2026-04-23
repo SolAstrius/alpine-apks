@@ -8,6 +8,11 @@
 
 const std = @import("std");
 const posix = std.posix;
+// Zig 0.16 removed posix.close / posix.write (moved to std.Io). For this
+// plain-CLI tool we keep things simple and call libc directly for those
+// two — we already link musl. Reads can still go through std.posix.read
+// because it was retained.
+const c = std.c;
 const cobs = @import("cobs.zig");
 const mpack = @import("mpack.zig");
 
@@ -69,12 +74,13 @@ pub const Client = struct {
         @memcpy(path_buf[0..p.len], p);
         path_buf[p.len] = 0;
 
-        const fd = posix.openZ(
+        const fd = posix.openatZ(
+            posix.AT.FDCWD,
             @ptrCast(&path_buf),
             .{ .ACCMODE = .RDWR, .NOCTTY = true, .CLOEXEC = true },
             0,
         ) catch return error.OpenFailed;
-        errdefer posix.close(fd);
+        errdefer _ = c.close(fd);
 
         try setRaw(fd);
 
@@ -89,7 +95,7 @@ pub const Client = struct {
     }
 
     pub fn close(self: *Client) void {
-        posix.close(self.fd);
+        _ = c.close(self.fd);
         self.fd = -1;
     }
 
@@ -222,8 +228,10 @@ pub const Client = struct {
         const n = cobs.encode(payload, &self.encoded);
         var off: usize = 0;
         while (off < n) {
-            const written = posix.write(self.fd, self.encoded[off..n]) catch return Error.WriteFailed;
-            off += written;
+            const rc = c.write(self.fd, self.encoded[off..].ptr, n - off);
+            if (rc < 0) return Error.WriteFailed;
+            if (rc == 0) return Error.WriteFailed;
+            off += @intCast(rc);
         }
     }
 

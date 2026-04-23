@@ -1,0 +1,21 @@
+# Nix / direnv
+result
+result-*
+.direnv/
+
+# Zig build outputs (per-source tree)
+sources/*/zig-out/
+sources/*/zig-cache/
+sources/*/.zig-cache/
+sources/*/build/
+
+# abuild scratch + outputs
+.abuild/
+main/*/src/
+main/*/pkg/
+*.apk
+APKINDEX.tar.gz
+
+# Private signing keys — only .rsa.pub belongs in git
+*.rsa
+!keys/*.rsa.pub

@@ -1,0 +1,171 @@
+name: Build & Publish APKs
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  ALPINE_BRANCH: v3.23
+  REPO_NAME: main
+  SIGNING_KEY_NAME: SolAstrius@alpine-apks.rsa
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, riscv64]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jirutka/setup-alpine@v1
+        with:
+          branch: ${{ env.ALPINE_BRANCH }}
+          packages: alpine-sdk zig sudo
+
+      - name: Install signing key
+        shell: alpine.sh --root {0}
+        env:
+          ABUILD_PRIVKEY: ${{ secrets.ABUILD_PRIVKEY }}
+        run: |
+          set -eu
+          install -d -m 700 /root/.abuild
+          printf '%s' "$ABUILD_PRIVKEY" > "/root/.abuild/$SIGNING_KEY_NAME"
+          chmod 600 "/root/.abuild/$SIGNING_KEY_NAME"
+          echo "PACKAGER_PRIVKEY=\"/root/.abuild/$SIGNING_KEY_NAME\"" > /root/.abuild/abuild.conf
+          install -D -m 644 "$GITHUB_WORKSPACE/keys/$SIGNING_KEY_NAME.pub" "/etc/apk/keys/$SIGNING_KEY_NAME.pub"
+          # runner user needs its own copy of the key + conf
+          runner_home=$(getent passwd runner | cut -d: -f6)
+          install -d -m 700 -o runner -g runner "$runner_home/.abuild"
+          cp "/root/.abuild/$SIGNING_KEY_NAME" "$runner_home/.abuild/"
+          cp /root/.abuild/abuild.conf "$runner_home/.abuild/"
+          chown -R runner:runner "$runner_home/.abuild"
+          chmod 600 "$runner_home/.abuild/$SIGNING_KEY_NAME"
+
+      - name: Build packages
+        shell: alpine.sh {0}
+        env:
+          CARCH: ${{ matrix.arch }}
+        run: |
+          set -eu
+          for pkg in main/*/; do
+            name=$(basename "$pkg")
+            echo "::group::abuild $name ($CARCH)"
+            ( cd "$pkg" && CARCH="$CARCH" abuild -F )
+            echo "::endgroup::"
+          done
+
+      - name: Collect APKs
+        shell: alpine.sh {0}
+        run: |
+          set -eu
+          out="$GITHUB_WORKSPACE/out/alpine/$ALPINE_BRANCH/$REPO_NAME/$CARCH"
+          mkdir -p "$out"
+          # abuild outputs to $HOME/packages/<repo>/<arch>/*.apk (repo = parent dir of APKBUILD's parent)
+          find "$HOME/packages/$REPO_NAME/$CARCH" -name '*.apk' -exec cp {} "$out/" \;
+          ls -la "$out"
+        env:
+          CARCH: ${{ matrix.arch }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apks-${{ matrix.arch }}
+          path: out/
+
+  publish:
+    name: publish to gh-pages
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: pages
+        continue-on-error: true
+
+      - name: Bootstrap gh-pages if missing
+        run: |
+          if [ ! -d pages/.git ]; then
+            rm -rf pages
+            git clone --depth=1 "https://github.com/${{ github.repository }}.git" pages || true
+            if [ ! -d pages/.git ]; then
+              mkdir pages
+              cd pages
+              git init -b gh-pages
+              git remote add origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+            else
+              cd pages
+              git checkout --orphan gh-pages
+              git rm -rf . 2>/dev/null || true
+            fi
+          fi
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - uses: jirutka/setup-alpine@v1
+        with:
+          branch: ${{ env.ALPINE_BRANCH }}
+          packages: alpine-sdk apk-tools
+
+      - name: Install signing key
+        shell: alpine.sh --root {0}
+        env:
+          ABUILD_PRIVKEY: ${{ secrets.ABUILD_PRIVKEY }}
+        run: |
+          set -eu
+          install -d -m 700 /root/.abuild
+          printf '%s' "$ABUILD_PRIVKEY" > "/root/.abuild/$SIGNING_KEY_NAME"
+          chmod 600 "/root/.abuild/$SIGNING_KEY_NAME"
+
+      - name: Merge APKs and regenerate signed APKINDEX per arch
+        shell: alpine.sh --root {0}
+        run: |
+          set -eu
+          cd "$GITHUB_WORKSPACE/pages"
+          # Copy artifacts into tree
+          for art in "$GITHUB_WORKSPACE"/artifacts/apks-*/alpine/"$ALPINE_BRANCH"/"$REPO_NAME"/*/; do
+            [ -d "$art" ] || continue
+            arch=$(basename "$art")
+            dest="alpine/$ALPINE_BRANCH/$REPO_NAME/$arch"
+            mkdir -p "$dest"
+            cp -f "$art"/*.apk "$dest/"
+          done
+          # Copy the public key so consumers can curl it
+          install -D -m 644 "$GITHUB_WORKSPACE/keys/$SIGNING_KEY_NAME.pub" "keys/$SIGNING_KEY_NAME.pub"
+          # Rebuild + sign per-arch index
+          for d in alpine/"$ALPINE_BRANCH"/"$REPO_NAME"/*/; do
+            ( cd "$d"
+              apk index -o APKINDEX.tar.gz.unsigned *.apk
+              abuild-sign -k "/root/.abuild/$SIGNING_KEY_NAME" APKINDEX.tar.gz.unsigned
+              mv APKINDEX.tar.gz.unsigned APKINDEX.tar.gz
+            )
+          done
+
+      - name: Publish
+        working-directory: pages
+        run: |
+          set -eu
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Ensure we're on gh-pages
+          git checkout -B gh-pages
+          git add -A
+          if git diff --cached --quiet; then
+            echo "no changes"
+            exit 0
+          fi
+          git commit -m "publish: ${GITHUB_SHA::7} ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
+          # remote may already be set from the checkout; add only if missing
+          git remote | grep -q '^origin$' || git remote add origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          git remote set-url origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          git push -u origin gh-pages

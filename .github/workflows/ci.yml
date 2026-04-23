@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  zig-test:
+    name: zig build test (sources/scev)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: 0.15.1
+
+      - run: zig build test
+        working-directory: sources/scev
+
+  apkbuild-lint:
+    name: apkbuild-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jirutka/setup-alpine@v1
+        with:
+          branch: v3.23
+          packages: atools
+
+      - shell: alpine.sh {0}
+        run: |
+          set -eu
+          status=0
+          for f in main/*/APKBUILD; do
+            echo "::group::$f"
+            apkbuild-lint "$f" || status=1
+            echo "::endgroup::"
+          done
+          exit "$status"

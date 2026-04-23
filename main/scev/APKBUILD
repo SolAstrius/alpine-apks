@@ -11,7 +11,12 @@ license="MPL-2.0"
 # tarball from the CI workflow because Alpine's packaged zig is too
 # old for the 0.16 APIs used in sources/scev. The build assumes zig
 # is on $PATH.
-options="!check !tracedeps"
+# !check  — unit tests run in the zig-test CI job, not during apk build
+# !tracedeps — the binary is statically linked musl; no shlib deps to scan
+# !strip  — zig already strips ReleaseFast output; abuild would invoke
+#           a cross-arch strip binary (riscv64-alpine-linux-musl-strip)
+#           that isn't shipped for non-native arches
+options="!check !tracedeps !strip"
 
 # In-tree source: the Zig tree lives at ../../sources/scev in this
 # monorepo. We skip abuild's fetch/source= machinery and copy the
@@ -19,7 +24,9 @@ options="!check !tracedeps"
 # Bump pkgver or pkgrel to force a rebuild.
 unpack() {
 	mkdir -p "$builddir"
-	cp -a "$startdir/../../sources/$pkgname/." "$builddir/"
+	# cp -r (not -a): we can't preserve ownership inside the CI chroot,
+	# and we don't need the mtime/owner fidelity -a gives.
+	cp -r "$startdir/../../sources/$pkgname/." "$builddir/"
 }
 
 build() {

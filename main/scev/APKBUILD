@@ -7,7 +7,10 @@ pkgdesc="Scalar Evolution guest RPC CLI (Zig)"
 url="https://github.com/SolAstrius/alpine-apks"
 arch="x86_64 riscv64"
 license="MPL-2.0"
-makedepends="zig"
+# zig isn't listed in makedepends: we pull a specific upstream zig
+# tarball from the CI workflow because Alpine's packaged zig is too
+# old for the 0.16 APIs used in sources/scev. The build assumes zig
+# is on $PATH.
 options="!check !tracedeps"
 
 # In-tree source: the Zig tree lives at ../../sources/scev in this

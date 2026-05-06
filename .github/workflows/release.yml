@@ -91,6 +91,14 @@ jobs:
             "$GITHUB_WORKSPACE/keys/$SIGNING_KEY_NAME.pub" \
             "/etc/apk/keys/$SIGNING_KEY_NAME.pub"
 
+          # abuild's `-r` flag uses abuild-apk to install missing build
+          # deps without root. abuild-apk is a setuid wrapper that
+          # requires the invoker to be in the `abuild` group; the
+          # setup-alpine action drops us in as `runner`, which is not
+          # in that group by default. Add it now so subsequent abuild
+          # -r calls can fetch py3-* makedeps from the Alpine repos.
+          sudo addgroup runner abuild
+
           for pkg in main/*/; do
             name=$(basename "$pkg")
             echo "::group::abuild $name ($CARCH)"

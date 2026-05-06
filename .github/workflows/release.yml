@@ -147,18 +147,34 @@ jobs:
           set -eu
           out="$GITHUB_WORKSPACE/out/alpine/$ALPINE_BRANCH/$REPO_NAME/$CARCH"
           mkdir -p "$out"
-          # abuild outputs to $HOME/packages/<repo>/<arch>/*.apk for
-          # arch-specific packages, and <repo>/noarch/*.apk for any
-          # APKBUILD with arch="noarch" (e.g., py3-scev). Collect both:
-          # the matrix runs both x86_64 and riscv64 legs, so both will
-          # publish the same noarch .apk into their per-arch dest dir
-          # — the publish step dedupes naturally because the filenames
-          # match. Slight redundancy in CI for a much simpler pipeline
-          # than special-casing noarch.
+          # abuild outputs to $HOME/packages/<repo>/<arch>/*.apk. For
+          # APKBUILD entries with arch="noarch" (e.g., py3-scev) it
+          # writes to $HOME/packages/<repo>/noarch/.
+          #
+          # Critical detail: apk-tools downloads packages from
+          # `<repo>/<A:>/<filename>` where `<A:>` is the package's
+          # *own* arch (from its index entry), not the host arch.
+          # That means a package marked A:noarch must be fetchable at
+          # `<repo>/noarch/<filename>` — placing it only in the
+          # per-arch dirs gives a 404 on `apk add`.
+          #
+          # We publish to BOTH locations:
+          #   site/<arch>/  → contains per-arch .apks for this arch
+          #   site/noarch/  → contains every noarch package
+          # The per-arch APKINDEX still lists noarch packages (the apk
+          # index step is per-dir), so `apk update` finds them and
+          # `apk add` resolves to `<repo>/noarch/<file>`.
           if [ -d "$HOME/packages/$REPO_NAME/$CARCH" ]; then
             find "$HOME/packages/$REPO_NAME/$CARCH" -name '*.apk' -exec cp {} "$out/" \;
           fi
           if [ -d "$HOME/packages/$REPO_NAME/noarch" ]; then
+            noarch_out="$GITHUB_WORKSPACE/out/alpine/$ALPINE_BRANCH/$REPO_NAME/noarch"
+            mkdir -p "$noarch_out"
+            find "$HOME/packages/$REPO_NAME/noarch" -name '*.apk' -exec cp {} "$noarch_out/" \;
+            # ALSO drop noarch packages into the per-arch dir so they
+            # appear in that dir's APKINDEX (built by `apk index *.apk`
+            # in the publish step). apk uses the per-arch index to
+            # discover packages but the noarch path to download them.
             find "$HOME/packages/$REPO_NAME/noarch" -name '*.apk' -exec cp {} "$out/" \;
           fi
           ls -la "$out"

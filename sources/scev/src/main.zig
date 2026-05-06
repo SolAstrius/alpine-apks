@@ -66,6 +66,7 @@ fn runMain(init: std.process.Init.Minimal) !u8 {
     if (std.mem.eql(u8, cmd, "log"))  return try cmdLog(&client, rest.items, alloc);
     if (std.mem.eql(u8, cmd, "call")) return try cmdCall(&client, rest.items);
     if (std.mem.eql(u8, cmd, "events")) return try cmdEvents(&client, rest.items);
+    if (std.mem.eql(u8, cmd, "modem-call")) return try cmdModemCall(&client, rest.items);
     if (std.mem.eql(u8, cmd, "list")) return try cmdList(&client);
     if (std.mem.eql(u8, cmd, "methods")) return try cmdMethods(&client, rest.items);
     if (std.mem.eql(u8, cmd, "type")) return try cmdType(&client, rest.items);
@@ -563,6 +564,112 @@ fn cmdEvents(c: *rpc.Client, rest: [][]const u8) !u8 {
         count += 1;
         if (max_count > 0 and count >= max_count) return 0;
     }
+}
+
+/// `scev modem-call <modem> <target_ch> <reply_ch> <msg> [count] [timeout_ms]`
+///
+/// Send-and-listen in a single scev process. Linux's serial TTY layer
+/// flushes the input queue on last close — so the usual two-step flow of
+/// "scev call ... transmit" then "scev events" loses any reply that
+/// arrives in the gap between processes. By keeping one fd open across
+/// the modem.open + modem.transmit + reply listen, we don't surrender
+/// the kernel buffer at any point.
+///
+/// Output: one line per inbound TAG_EVENT frame (typically
+/// `modem_message [side, ch, reply_ch, payload, distance]`), stops
+/// after `count` events (default 1) or when `recvFrame` times out.
+///
+/// Doesn't filter by channel — the caller (cssh, etc.) greps for its
+/// own correlation id from the payload column. Keeps the subcommand
+/// generic; downstream pipelines pick what they want.
+fn cmdModemCall(c: *rpc.Client, rest: [][]const u8) !u8 {
+    if (rest.len < 4) {
+        std.debug.print("usage: scev modem-call <modem> <target_ch> <reply_ch> <msg> [count] [timeout_ms]\n", .{});
+        return 64;
+    }
+    const modem = rest[0];
+    const target_ch = std.fmt.parseInt(i64, rest[1], 10) catch {
+        std.debug.print("scev: bad target_ch: {s}\n", .{rest[1]});
+        return 64;
+    };
+    const reply_ch = std.fmt.parseInt(i64, rest[2], 10) catch {
+        std.debug.print("scev: bad reply_ch: {s}\n", .{rest[2]});
+        return 64;
+    };
+    const message = rest[3];
+    const max_count: i32 = if (rest.len >= 5) std.fmt.parseInt(i32, rest[4], 10) catch 1 else 1;
+    const timeout_ms: i32 = if (rest.len >= 6) std.fmt.parseInt(i32, rest[5], 10) catch 5000 else 5000;
+
+    // 1) modem.open(reply_ch). Fire the request; we don't wait for the
+    //    response synchronously because doing so via runCall would drop
+    //    any events that happen to arrive in the same window. The recv
+    //    loop below skips TAG_RESPONSE frames anyway.
+    const OpenCtx = struct { modem: []const u8, ch: i64 };
+    var open_ctx = OpenCtx{ .modem = modem, .ch = reply_ch };
+    {
+        const gen = struct {
+            fn emit(e: *mpack.Encoder, user: ?*anyopaque) anyerror!void {
+                const ctx: *OpenCtx = @ptrCast(@alignCast(user.?));
+                try e.arrayHeader(3);
+                try e.str(ctx.modem);
+                try e.str("open");
+                try e.int(ctx.ch);
+            }
+        };
+        const id = c.next_id;
+        c.next_id += 1;
+        c.sendRequest(id, rpc.METHOD_CALL, gen.emit, @ptrCast(&open_ctx)) catch |e| {
+            std.debug.print("scev: send error: {s}\n", .{@errorName(e)});
+            return 1;
+        };
+    }
+
+    // 2) modem.transmit(target_ch, reply_ch, message). Same fire-and-
+    //    forget, in the same fd / kernel-buffer epoch as the listen.
+    const TxCtx = struct { modem: []const u8, target_ch: i64, reply_ch: i64, msg: []const u8 };
+    var tx_ctx = TxCtx{ .modem = modem, .target_ch = target_ch, .reply_ch = reply_ch, .msg = message };
+    {
+        const gen = struct {
+            fn emit(e: *mpack.Encoder, user: ?*anyopaque) anyerror!void {
+                const ctx: *TxCtx = @ptrCast(@alignCast(user.?));
+                try e.arrayHeader(5);
+                try e.str(ctx.modem);
+                try e.str("transmit");
+                try e.int(ctx.target_ch);
+                try e.int(ctx.reply_ch);
+                try e.str(ctx.msg);
+            }
+        };
+        const id = c.next_id;
+        c.next_id += 1;
+        c.sendRequest(id, rpc.METHOD_CALL, gen.emit, @ptrCast(&tx_ctx)) catch |e| {
+            std.debug.print("scev: send error: {s}\n", .{@errorName(e)});
+            return 1;
+        };
+    }
+
+    // 3) Drain frames; print events, skip responses (the open + transmit
+    //    nil-acks). Stop on count or timeout.
+    var count: i32 = 0;
+    while (count < max_count) {
+        const frame = c.recvFrame(timeout_ms) catch |e| {
+            if (e == rpc.Error.Timeout) return if (count > 0) 0 else 124;
+            std.debug.print("scev: recv error: {s}\n", .{@errorName(e)});
+            return 1;
+        };
+        var dec = mpack.Decoder.init(frame);
+        const arr_n = dec.readArrayHeader() catch continue;
+        if (arr_n < 1) continue;
+        const tag = dec.readInt() catch continue;
+        if (tag != rpc.TAG_EVENT) continue;
+        if (arr_n < 2) continue;
+        const name = dec.readStr() catch continue;
+        std.debug.print("{s} ", .{name});
+        printValue(&dec, 0);
+        std.debug.print("\n", .{});
+        count += 1;
+    }
+    return 0;
 }
 
 const ArgsCtx = struct { toks: [][]const u8 };

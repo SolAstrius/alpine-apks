@@ -30,6 +30,10 @@ from . import _rpc
 from .events import Event
 from .peripheral import Peripheral, _build_peripheral_class
 
+# Sentinel for "no filter" — None already means "no timeout" in
+# pull_event so we need a distinct value for the filter parameter.
+_NO_FILTER = object()
+
 
 @dataclass(frozen=True)
 class MachineInfo:
@@ -178,26 +182,71 @@ class Machine:
         self,
         count: int | None = None,
         *,
+        filter: str | tuple[str, ...] | None = None,
         subscribe: bool = True,
         timeout: float | None = None,
     ) -> Iterator[Event]:
-        """Generator over inbound CC events. With `subscribe=True`
-        (default) we send the no-op SUBSCRIBE on entry so the host has
-        a chance to start any per-machine event pump it wants. Set
-        `count` to limit the number yielded; default is forever."""
+        """Generator over inbound CC events. Yields parsed [Event][]
+        instances — known event names get structured subclasses
+        (ModemMessage, RednetMessage, MonitorTouch, Disk, …) so
+        pattern-matching by class works; unknown names fall back to a
+        generic `Event(name, args)`.
+
+        `filter`: a name or tuple of names to keep — others are
+        silently discarded. None (default) yields everything.
+
+        `count`: stop after N matches; None (default) is unbounded.
+
+        `timeout`: per-event recv timeout in seconds. `Timeout` is
+        raised if no frame arrives within the window. Useful for
+        non-blocking polling loops; the inner `recv_event` resets
+        the deadline on each call.
+
+        With `subscribe=True` (default) the no-op SUBSCRIBE is sent on
+        entry so the host can start any per-machine event pump it
+        wants. Errors on subscribe are tolerated — the host's default
+        handler is a no-op anyway."""
         if subscribe:
             try:
                 self._client.call(_rpc.METHOD_SUBSCRIBE, timeout=3.0)
             except _rpc.RpcError:
-                # `subscribe` is a no-op on the host today; ignore any
-                # not-installed style errors so the iterator still works
-                # in environments where the handler isn't wired up.
                 pass
+        wanted = (
+            None
+            if filter is None
+            else (filter,) if isinstance(filter, str) else tuple(filter)
+        )
         i = 0
         while count is None or i < count:
             name, args = self._client.recv_event(timeout=timeout)
-            yield Event(name, args)
+            if wanted is not None and name not in wanted:
+                continue
+            yield Event.parse(name, args)
             i += 1
+
+    def pull_event(
+        self,
+        filter: str | tuple[str, ...] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> Event:
+        """Single-shot equivalent of CC's `os.pullEvent([filter])`.
+        Blocks until a matching event arrives (or `timeout` elapses,
+        if set). Equivalent to `next(m.events(count=1, filter=...,
+        subscribe=False, timeout=timeout))` but without the subscribe
+        round-trip — assume the caller has already entered an
+        events()/subscribe context if needed.
+
+        Returns a parsed [Event][] (structured subclass when known)."""
+        wanted = (
+            None
+            if filter is None
+            else (filter,) if isinstance(filter, str) else tuple(filter)
+        )
+        while True:
+            name, args = self._client.recv_event(timeout=timeout)
+            if wanted is None or name in wanted:
+                return Event.parse(name, args)
 
     # ----------------------------------------------------- Mapping surface
 
@@ -231,14 +280,53 @@ class Machine:
             return False
         return any(entry.get("peer") == name for entry in self.list_peripherals())
 
-    def find(self, peripheral_type: str) -> list[Peripheral]:
-        """Return every peripheral whose type set contains
-        `peripheral_type` — equivalent to `peripheral.find(type)`."""
-        return [
-            self[entry["peer"]]
-            for entry in self.list_peripherals()
-            if peripheral_type in (entry.get("types") or [])
-        ]
+    def find(
+        self,
+        peripheral_type: str,
+        filter: Any = None,
+    ) -> list[Peripheral]:
+        """Equivalent of CC's `peripheral.find(type, filter)`.
+
+        Returns every peripheral whose type set contains
+        `peripheral_type`. Optional `filter(name, peripheral)` callable
+        narrows further — return False to skip. The callback receives
+        the same fully-introspected Peripheral object the index returns,
+        so it can call methods on it to decide:
+
+            chests = m.find("inventory", lambda _, p: p.size() > 27)
+        """
+        out: list[Peripheral] = []
+        for entry in self.list_peripherals():
+            if peripheral_type not in (entry.get("types") or []):
+                continue
+            peer_name = entry.get("peer")
+            if not isinstance(peer_name, str):
+                continue
+            p = self[peer_name]
+            if filter is not None and not filter(peer_name, p):
+                continue
+            out.append(p)
+        return out
+
+    def find_first(
+        self,
+        peripheral_type: str,
+        filter: Any = None,
+    ) -> Peripheral | None:
+        """First match of [find][scev.machine.Machine.find], or None.
+        Equivalent to `next(iter(m.find(type, filter)), None)` but
+        bails out on first hit so we don't pay describe-cost for
+        peripherals we won't use."""
+        for entry in self.list_peripherals():
+            if peripheral_type not in (entry.get("types") or []):
+                continue
+            peer_name = entry.get("peer")
+            if not isinstance(peer_name, str):
+                continue
+            p = self[peer_name]
+            if filter is None or filter(peer_name, p):
+                return p
+        return None
 
 
 class PeripheralView(Mapping[str, Peripheral]):

@@ -123,8 +123,12 @@ jobs:
                 printf '%s %s %s' "$makedepends" "$checkdepends" "$depends"
               )
               # Strip the make/checkdepends-style "!options" tokens
-              # that abuild treats specially — apk would choke on them.
-              filtered=$(echo "$deps" | tr ' ' '\n' | grep -v '^!' | grep -v '^$' | sort -u | tr '\n' ' ')
+              # that abuild treats specially, plus blank entries.
+              # awk-based filter: never exits non-zero on empty input,
+              # which matters because the parent shell has set -e and
+              # `grep -v` returns 1 when its output is empty (the case
+              # for any package with no extra deps, e.g. the Zig one).
+              filtered=$(echo "$deps" | tr ' ' '\n' | awk '/^[^!]./' | sort -u | tr '\n' ' ')
               if [ -n "$(echo "$filtered" | tr -d ' ')" ]; then
                 echo "+ sudo apk add $filtered"
                 # shellcheck disable=SC2086

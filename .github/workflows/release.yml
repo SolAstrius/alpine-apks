@@ -62,7 +62,11 @@ jobs:
       - uses: jirutka/setup-alpine@v1
         with:
           branch: ${{ env.ALPINE_BRANCH }}
-          packages: alpine-sdk sudo
+          # `shadow` provides `sg`, which we need to enter the abuild
+          # group within an already-running shell (the addgroup we do
+          # later only applies after a fresh login, so we wrap abuild
+          # invocations in `sg abuild -c ...` instead).
+          packages: alpine-sdk sudo shadow
 
       - name: Build packages
         shell: alpine.sh {0}
@@ -93,23 +97,33 @@ jobs:
 
           # abuild's `-r` flag uses abuild-apk to install missing build
           # deps without root. abuild-apk is a setuid wrapper that
-          # requires the invoker to be in the `abuild` group; the
-          # setup-alpine action drops us in as `runner`, which is not
-          # in that group by default. Add it now so subsequent abuild
-          # -r calls can fetch py3-* makedeps from the Alpine repos.
+          # requires the invoker to be in the `abuild` group; setup-
+          # alpine drops us in as `runner` which is not in that group
+          # by default. Adding the group here records it in /etc/group
+          # but the *current* shell still has stale supplementary
+          # groups — abuild-apk reads them via getgroups(2) at startup.
+          # `sg abuild -c '...'` spawns a subshell with the group
+          # active, which is what abuild-apk actually checks.
           sudo addgroup runner abuild
 
-          for pkg in main/*/; do
-            name=$(basename "$pkg")
-            echo "::group::abuild $name ($CARCH)"
-            # -F: force rebuild even when the apk seems up to date.
-            # -r: auto-install missing makedepends/checkdepends via
-            #     `sudo apk add` before building. Required for any
-            #     APKBUILD that pulls in deps from the alpine repos
-            #     (e.g. py3-scev needs py3-gpep517, py3-hatchling, …).
-            ( cd "$pkg" && CARCH="$CARCH" PATH="$GITHUB_WORKSPACE/.zig:$PATH" abuild -rF )
-            echo "::endgroup::"
-          done
+          # Wrap the whole abuild loop in one sg invocation so we pay
+          # the subshell-startup cost once. Single-quote the body so
+          # the parent shell doesn't try to expand $pkg/$name (those
+          # are local to the inner loop). $CARCH and $GITHUB_WORKSPACE
+          # are real env vars and survive the sg fork unchanged.
+          sg abuild -c '
+            set -eu
+            for pkg in main/*/; do
+              name=$(basename "$pkg")
+              echo "::group::abuild $name ($CARCH)"
+              # -F: force rebuild even when the apk seems up to date.
+              # -r: auto-install missing makedepends/checkdepends via
+              #     abuild-apk (which is now allowed because we ran
+              #     this loop inside sg abuild).
+              ( cd "$pkg" && CARCH="$CARCH" PATH="$GITHUB_WORKSPACE/.zig:$PATH" abuild -rF )
+              echo "::endgroup::"
+            done
+          '
 
       - name: Collect APKs
         shell: alpine.sh {0}

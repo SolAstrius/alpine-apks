@@ -126,13 +126,17 @@ while IFS= read -r mirror; do
         continue
     fi
     # Downgrade-attack guard: the trusted comment of a ZSF-signed
-    # tarball includes a `file=<basename>` field. A malicious or
+    # tarball includes a `file:<basename>` field. A malicious or
     # misconfigured mirror could serve us a different (older /
     # other-arch) tarball that still verifies against the same key;
     # checking this field rejects that case. minisign itself doesn't
     # parse this field, so we grep it out of the signature file.
-    actual_file="$(grep -oE 'file=[^[:space:]]+' "$WORKDIR/zig.tar.xz.minisig" \
-        | head -n1 | cut -d= -f2- || true)"
+    #
+    # The ZSF documentation says `file=…`; actual wire format uses
+    # `file:…` (colon). Accept either to be defensive against future
+    # reconciliation.
+    actual_file="$(grep -oE 'file[=:][^[:space:]]+' "$WORKDIR/zig.tar.xz.minisig" \
+        | head -n1 | sed -E 's/^file[=:]//' || true)"
     if [ "$actual_file" != "$TARBALL" ]; then
         echo "  trusted-comment file mismatch: expected '$TARBALL', got '$actual_file'"
         echo "::endgroup::"

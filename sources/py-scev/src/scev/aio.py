@@ -167,11 +167,12 @@ class AsyncClient:
                 except OSError:
                     return
                 if not chunk:
-                    # EOF — fail any pending calls.
-                    for fut in self._pending.values():
-                        if not fut.done():
-                            fut.set_exception(_rpc.ProtocolError("EOF on serial"))
-                    return
+                    # With VMIN=VTIME=0 raw mode, a 0-byte read is
+                    # "no data buffered right now", not end-of-file.
+                    # break out of the inner drain loop and re-arm
+                    # the readable event — there's nothing to do
+                    # until more data arrives. NOT a fatal condition.
+                    break
                 self._rx.extend(chunk)
                 if len(self._rx) >= MAX_FRAME and 0 not in self._rx:
                     # Frame ran over cap with no delimiter — resync

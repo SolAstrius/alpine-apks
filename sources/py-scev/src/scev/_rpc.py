@@ -184,7 +184,13 @@ class Client:
             self._wait_readable(deadline)
             chunk = os.read(self.fd, MAX_FRAME)
             if not chunk:
-                raise ProtocolError("EOF on serial")
+                # With VMIN=VTIME=0 raw mode, os.read is allowed to
+                # return 0 bytes when no data is currently buffered —
+                # this is *not* EOF (a tty has no end-of-file in the
+                # usual sense; the remote can pause writing). Loop
+                # back to select. The deadline guards against
+                # busy-spinning if the host genuinely went away.
+                continue
             self._rx.extend(chunk)
 
     def _wait_readable(self, deadline: Optional[float]) -> None:

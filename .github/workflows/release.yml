@@ -94,7 +94,12 @@ jobs:
           for pkg in main/*/; do
             name=$(basename "$pkg")
             echo "::group::abuild $name ($CARCH)"
-            ( cd "$pkg" && CARCH="$CARCH" PATH="$GITHUB_WORKSPACE/.zig:$PATH" abuild -F )
+            # -F: force rebuild even when the apk seems up to date.
+            # -r: auto-install missing makedepends/checkdepends via
+            #     `sudo apk add` before building. Required for any
+            #     APKBUILD that pulls in deps from the alpine repos
+            #     (e.g. py3-scev needs py3-gpep517, py3-hatchling, …).
+            ( cd "$pkg" && CARCH="$CARCH" PATH="$GITHUB_WORKSPACE/.zig:$PATH" abuild -rF )
             echo "::endgroup::"
           done
 

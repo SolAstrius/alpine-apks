@@ -147,37 +147,47 @@ jobs:
           set -eu
           out="$GITHUB_WORKSPACE/out/alpine/$ALPINE_BRANCH/$REPO_NAME/$CARCH"
           mkdir -p "$out"
-          # abuild outputs to $HOME/packages/<repo>/<arch>/*.apk. For
-          # APKBUILD entries with arch="noarch" (e.g., py3-scev) it
-          # writes to $HOME/packages/<repo>/noarch/.
+          # abuild 3.16 puts ALL packages in `$HOME/packages/<repo>/<CARCH>/`
+          # — including noarch packages, despite the package's own
+          # `A:noarch` field in the index entry. There's no separate
+          # `$HOME/packages/<repo>/noarch/` directory we can scan.
           #
-          # Critical detail: apk-tools downloads packages from
-          # `<repo>/<A:>/<filename>` where `<A:>` is the package's
-          # *own* arch (from its index entry), not the host arch.
-          # That means a package marked A:noarch must be fetchable at
-          # `<repo>/noarch/<filename>` — placing it only in the
-          # per-arch dirs gives a 404 on `apk add`.
+          # Critical detail for the publish step: apk-tools downloads
+          # packages from `<repo>/<A:>/<filename>` where `<A:>` is the
+          # package's own arch field (from the index), not the host
+          # arch. A package marked A:noarch must therefore be
+          # fetchable at `<repo>/noarch/<filename>` — placing it only
+          # in the per-arch dirs gives a 404 on `apk add`.
           #
-          # We publish to BOTH locations:
-          #   site/<arch>/  → contains per-arch .apks for this arch
-          #   site/noarch/  → contains every noarch package
-          # The per-arch APKINDEX still lists noarch packages (the apk
-          # index step is per-dir), so `apk update` finds them and
-          # `apk add` resolves to `<repo>/noarch/<file>`.
+          # We need to identify noarch packages explicitly by parsing
+          # their .PKGINFO (.apk is a gzipped tar with .PKGINFO at the
+          # root). For each apk we inspect, if its `arch = noarch` we
+          # duplicate it into a sibling noarch_out dir. The per-arch
+          # APKINDEX (built later by `apk index *.apk`) still lists
+          # them so `apk update` finds them and `apk add` resolves to
+          # `<repo>/noarch/<file>`.
+          noarch_out="$GITHUB_WORKSPACE/out/alpine/$ALPINE_BRANCH/$REPO_NAME/noarch"
+          mkdir -p "$noarch_out"
           if [ -d "$HOME/packages/$REPO_NAME/$CARCH" ]; then
-            find "$HOME/packages/$REPO_NAME/$CARCH" -name '*.apk' -exec cp {} "$out/" \;
+            for apk in "$HOME/packages/$REPO_NAME/$CARCH"/*.apk; do
+              [ -f "$apk" ] || continue
+              cp "$apk" "$out/"
+              # .PKGINFO lives at the tar root and has lines like
+              # `arch = noarch` (whitespace around `=`). The .apk is
+              # gzipped tar; tar -O dumps members to stdout.
+              pkg_arch=$(tar -xzOf "$apk" .PKGINFO 2>/dev/null \
+                | awk -F'=' '/^arch *=/{gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}')
+              if [ "$pkg_arch" = "noarch" ]; then
+                cp "$apk" "$noarch_out/"
+              fi
+            done
           fi
-          if [ -d "$HOME/packages/$REPO_NAME/noarch" ]; then
-            noarch_out="$GITHUB_WORKSPACE/out/alpine/$ALPINE_BRANCH/$REPO_NAME/noarch"
-            mkdir -p "$noarch_out"
-            find "$HOME/packages/$REPO_NAME/noarch" -name '*.apk' -exec cp {} "$noarch_out/" \;
-            # ALSO drop noarch packages into the per-arch dir so they
-            # appear in that dir's APKINDEX (built by `apk index *.apk`
-            # in the publish step). apk uses the per-arch index to
-            # discover packages but the noarch path to download them.
-            find "$HOME/packages/$REPO_NAME/noarch" -name '*.apk' -exec cp {} "$out/" \;
-          fi
+          # Drop the noarch dir if nothing landed there — keeps the
+          # artifact tidy and avoids upload-artifact warnings.
+          rmdir "$noarch_out" 2>/dev/null || true
           ls -la "$out"
+          echo "--- noarch ---"
+          ls -la "$noarch_out" 2>/dev/null || echo "(no noarch packages)"
 
       - uses: actions/upload-artifact@v4
         with:

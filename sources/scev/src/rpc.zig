@@ -272,7 +272,9 @@ pub const Response = struct {
 // libc tcflush — std.posix doesn't expose it. We're linked against
 // musl so this just resolves at link time.
 extern "c" fn tcflush(fd: c_int, queue_selector: c_int) c_int;
-const TCIOFLUSH: c_int = 2;
+const TCIFLUSH:  c_int = 0;  // discard buffered input
+const TCOFLUSH:  c_int = 1;  // discard buffered output
+const TCIOFLUSH: c_int = 2;  // both (DON'T USE — drops legitimate queued input)
 
 /// Put the fd in raw 115200 8N1 mode — matches the scev NS16550A
 /// emulator's baud/format expectations. Raw-mode strips tty line-
@@ -306,9 +308,14 @@ fn setRaw(fd: posix.fd_t) !void {
 
     posix.tcsetattr(fd, .NOW, t) catch return Error.TcSetAttrFailed;
 
-    // Drop any cruft accumulated under the prior discipline. Errors
-    // here aren't fatal — we've still set raw mode for everything that
-    // happens next — but log-and-continue would be noisier than just
-    // ignoring the rc.
-    _ = tcflush(@intCast(fd), TCIOFLUSH);
+    // Flush ONLY the output queue. Anything queued for TX under the
+    // previous (cooked) discipline was about to go out as caret-encoded
+    // echo trash — we don't want that on the wire. But the input queue
+    // may legitimately hold bytes the host queued while no scev process
+    // had the fd open (events fired during a gap between invocations).
+    // Those frames are valid raw-mode bytes; preserve them so the
+    // events loop can drain them. The host's FrameStream has recovery
+    // for stale cooked-mode trash on its side, so even if some leaks
+    // through, it stays decodable.
+    _ = tcflush(@intCast(fd), TCOFLUSH);
 }

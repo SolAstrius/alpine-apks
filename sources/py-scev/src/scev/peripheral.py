@@ -193,11 +193,17 @@ def _make_remote_method(name: str) -> Any:
 
 def _build_peripheral_class(types: tuple[str, ...], describe: dict) -> type:
     """Walk a `describe` response and produce a concrete Peripheral
-    subclass. Three shapes are handled, matching main.zig:printDescribe:
+    subclass. Four shapes are handled:
 
-      * full:   describe[`groups`] = {className: [sig, ...]}
-      * narrow: describe[`method`] = sig                (single-method)
-      * remote: describe[`methods`] = [name, ...]       (no signatures)
+      * full:    describe[`groups`] = {className: [sig, ...]}
+                 — `@LuaFunction` methods with structured signatures.
+      * dynamic: describe[`dynamicMethods`] = [name, ...]
+                 — IDynamicPeripheral methods (generic-peripheral
+                 backed inventories, fluid handlers, energy storage,
+                 etc.). Names only, no signatures.
+      * narrow:  describe[`method`] = sig (single-method narrow query)
+      * remote:  describe[`methods`] = [name, ...] (wired-modem remote
+                 peripherals — no signatures available either)
     """
     namespace: dict[str, Any] = {}
     seen: set[str] = set()
@@ -214,6 +220,19 @@ def _build_peripheral_class(types: tuple[str, ...], describe: dict) -> type:
                         namespace[alias] = method
                         seen.add(alias)
 
+    # IDynamicPeripheral methods — most CC generic-peripheral backed
+    # things (inventory, fluid_storage, energy_storage on vanilla
+    # blocks) come through as `dynamicMethods`. Same shape as `methods`
+    # below but a different host key, so the host can flag whether
+    # the peripheral is built from `@LuaFunction` reflection or dynamic
+    # registration without us having to ask.
+    dynamic_methods = describe.get("dynamicMethods")
+    if dynamic_methods:
+        for nm in dynamic_methods:
+            if nm and nm not in seen:
+                namespace[nm] = _make_remote_method(nm)
+                seen.add(nm)
+
     method_def = describe.get("method")
     if method_def:
         method = _make_method(method_def)
@@ -227,7 +246,10 @@ def _build_peripheral_class(types: tuple[str, ...], describe: dict) -> type:
                 namespace[nm] = _make_remote_method(nm)
                 seen.add(nm)
 
-    pretty = "_".join(types) if types else "any"
+    # Type name can contain `:` (mod-namespaced peripherals like
+    # `minecraft:chest`). `type(name, ...)` accepts that, but it makes
+    # `__repr__` look weird — replace the colon with `_` for legibility.
+    pretty = "_".join(types).replace(":", "_") if types else "any"
     cls = type(f"Peripheral_{pretty}", (Peripheral,), namespace)
     return cls
 

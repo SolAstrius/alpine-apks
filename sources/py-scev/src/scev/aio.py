@@ -351,9 +351,23 @@ def _make_async_method(sig: dict) -> Any:
 
 
 def _build_async_peripheral_class(types: tuple[str, ...], describe: dict) -> type:
-    """Mirror of peripheral._build_peripheral_class for async methods."""
+    """Mirror of peripheral._build_peripheral_class for async methods.
+    Handles the same four shapes (groups / dynamicMethods / method /
+    methods) — see the sync version for what each one means."""
     namespace: dict[str, Any] = {}
     seen: set[str] = set()
+
+    def _install_remote(nm: str) -> None:
+        async def _remote(self: AsyncPeripheral, *args: Any, _nm=nm) -> Any:
+            return await self._machine._client.call(  # noqa: SLF001
+                "call", [self._name, _nm, *args], timeout=15.0
+            )
+
+        _remote.__name__ = nm
+        _remote.__qualname__ = nm
+        _remote.__doc__ = f"{nm}(...)  [remote — signature unknown]"
+        namespace[nm] = _remote
+        seen.add(nm)
 
     groups = describe.get("groups") or {}
     for _group, sigs in groups.items():
@@ -366,29 +380,23 @@ def _build_async_peripheral_class(types: tuple[str, ...], describe: dict) -> typ
                     namespace[alias] = method
                     seen.add(alias)
 
+    # IDynamicPeripheral — name list, no signatures. Same shape as
+    # remote-modem peripherals below; different host key.
+    for nm in describe.get("dynamicMethods") or []:
+        if nm and nm not in seen:
+            _install_remote(nm)
+
     method_def = describe.get("method")
     if method_def:
         method = _make_async_method(method_def)
         namespace[method_def["name"]] = method
         seen.add(method_def["name"])
 
-    methods_flat = describe.get("methods")
-    if methods_flat:
-        for nm in methods_flat:
-            if nm and nm not in seen:
+    for nm in describe.get("methods") or []:
+        if nm and nm not in seen:
+            _install_remote(nm)
 
-                async def _remote(self: AsyncPeripheral, *args: Any, _nm=nm) -> Any:
-                    return await self._machine._client.call(  # noqa: SLF001
-                        "call", [self._name, _nm, *args], timeout=15.0
-                    )
-
-                _remote.__name__ = nm
-                _remote.__qualname__ = nm
-                _remote.__doc__ = f"{nm}(...)  [remote — signature unknown]"
-                namespace[nm] = _remote
-                seen.add(nm)
-
-    pretty = "_".join(types) if types else "any"
+    pretty = "_".join(types).replace(":", "_") if types else "any"
     return type(f"AsyncPeripheral_{pretty}", (AsyncPeripheral,), namespace)
 
 

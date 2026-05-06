@@ -533,9 +533,15 @@ fn cmdMethodsLike(c: *rpc.Client, rest: [][]const u8) !u8 {
 fn cmdEvents(c: *rpc.Client, rest: [][]const u8) !u8 {
     const max_count: i32 = if (rest.len >= 1) std.fmt.parseInt(i32, rest[0], 10) catch -1 else -1;
 
-    // Subscribe first — no-op until the server grows real subscription
-    // support, but the plumbing is in place.
-    _ = runCall(c, rpc.METHOD_SUBSCRIBE, null, null, 3000) catch {};
+    // NOTE: we deliberately do NOT call SUBSCRIBE here. The host handler
+    // is a no-op stub today (returns nil), and crucially `Client.call`'s
+    // response-matching loop discards any non-RESPONSE frames it sees
+    // while waiting for the SUBSCRIBE reply. That includes events
+    // already queued in the UART RX from before we started — exactly
+    // the events `scev events` exists to print. Skipping the subscribe
+    // call lets us drain those queued events. When the host grows real
+    // subscription support, reintroduce this with a recvFrame variant
+    // that buffers non-matching frames for later.
 
     var count: i32 = 0;
     while (true) {

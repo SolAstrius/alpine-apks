@@ -2,7 +2,7 @@
 # Maintainer: Sol Astrius <sol@astrius.ink>
 pkgname=py3-scev
 _pyname=scev
-pkgver=0.3.0
+pkgver=0.3.1
 pkgrel=0
 pkgdesc="Scalar Evolution guest RPC client (Python) + scev CLI"
 url="https://github.com/SolAstrius/alpine-apks"

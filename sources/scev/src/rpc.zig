@@ -84,6 +84,21 @@ pub const Client = struct {
 
         try setRaw(fd);
 
+        // First-run hygiene: before we wrote anything, the tty was in
+        // cooked mode (the kernel's default). Any RPC bytes the host
+        // pushed during boot got echoed back into the TX queue with
+        // ECHOCTL substitutions (^@ for 0x00, ^B for 0x02, …). Some of
+        // that echo has likely already streamed out the UART and is
+        // sitting in the *host's* FrameStream as a partial COBS frame
+        // — tcflush above can't recall those bytes. Solution: send a
+        // bare 0x00 delimiter. The host's framer treats it as the end
+        // of whatever it had accumulated (decode fails on the junk and
+        // the frame is dropped), then resets cleanly for our actual
+        // request. A lone delimiter on an empty frame is a no-op for a
+        // healthy host, so this is safe to do unconditionally.
+        const flush_byte: [1]u8 = .{0};
+        _ = c.write(fd, &flush_byte, 1);
+
         return .{
             .fd = fd,
             .next_id = 1,
@@ -254,15 +269,32 @@ pub const Response = struct {
     bytes: []const u8,
 };
 
+// libc tcflush — std.posix doesn't expose it. We're linked against
+// musl so this just resolves at link time.
+extern "c" fn tcflush(fd: c_int, queue_selector: c_int) c_int;
+const TCIOFLUSH: c_int = 2;
+
 /// Put the fd in raw 115200 8N1 mode — matches the scev NS16550A
 /// emulator's baud/format expectations. Raw-mode strips tty line-
 /// discipline so we see every byte the host wrote.
+///
+/// Crucially, we then `tcflush(TCIOFLUSH)` to drop anything that was
+/// queued under the *previous* discipline. The tty defaults to cooked
+/// mode at boot, so any bytes the host pushed before scev's first run
+/// were echoed back into the TX queue with ^@/^B expansion (ECHOCTL)
+/// and any pending RX bytes are sitting in the canonical-mode line
+/// buffer waiting for a newline that's never coming. Both directions
+/// must be dropped before our first byte goes out, or the host's
+/// FrameStream will COBS-decode the echo trash mixed with our request
+/// and time out waiting for the response.
 fn setRaw(fd: posix.fd_t) !void {
     var t = posix.tcgetattr(fd) catch return Error.TcSetAttrFailed;
 
     // Manual cfmakeraw — Zig std doesn't expose the BSD helper, and
     // the termios flag fields are platform-typed bit-sets so we zero
-    // them by overwriting with defaults.
+    // them by overwriting with defaults. Zeroing lflag in particular
+    // clears ECHO/ECHOCTL/ICANON, which is what stops the cooked-mode
+    // echo loop on subsequent inbound bytes.
     t.iflag = @bitCast(@as(u32, 0));
     t.oflag = @bitCast(@as(u32, 0));
     t.lflag = @bitCast(@as(u32, 0));
@@ -273,4 +305,10 @@ fn setRaw(fd: posix.fd_t) !void {
     t.cc[@intFromEnum(posix.V.TIME)] = 0;
 
     posix.tcsetattr(fd, .NOW, t) catch return Error.TcSetAttrFailed;
+
+    // Drop any cruft accumulated under the prior discipline. Errors
+    // here aren't fatal — we've still set raw mode for everything that
+    // happens next — but log-and-continue would be noisier than just
+    // ignoring the rc.
+    _ = tcflush(@intCast(fd), TCIOFLUSH);
 }

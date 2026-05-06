@@ -112,11 +112,15 @@ jobs:
               cd "$pkg"
               # Subshell isolates APKBUILD's variable spew so it can't
               # leak makedepends from one package into the next.
+              # abuild's validate step also wants `depends` (runtime
+              # deps) resolvable up-front, not just makedepends —
+              # it builds the dep graph for the whole package, not
+              # just the build env. Source all three.
               deps=$(
                 set +u
-                makedepends=""; checkdepends=""
+                makedepends=""; checkdepends=""; depends=""
                 . ./APKBUILD
-                printf '%s %s' "$makedepends" "$checkdepends"
+                printf '%s %s %s' "$makedepends" "$checkdepends" "$depends"
               )
               # Strip the make/checkdepends-style "!options" tokens
               # that abuild treats specially — apk would choke on them.

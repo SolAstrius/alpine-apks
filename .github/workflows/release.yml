@@ -62,11 +62,7 @@ jobs:
       - uses: jirutka/setup-alpine@v1
         with:
           branch: ${{ env.ALPINE_BRANCH }}
-          # `shadow` provides `sg`, which we need to enter the abuild
-          # group within an already-running shell (the addgroup we do
-          # later only applies after a fresh login, so we wrap abuild
-          # invocations in `sg abuild -c ...` instead).
-          packages: alpine-sdk sudo shadow
+          packages: alpine-sdk sudo
 
       - name: Build packages
         shell: alpine.sh {0}
@@ -95,35 +91,45 @@ jobs:
             "$GITHUB_WORKSPACE/keys/$SIGNING_KEY_NAME.pub" \
             "/etc/apk/keys/$SIGNING_KEY_NAME.pub"
 
-          # abuild's `-r` flag uses abuild-apk to install missing build
-          # deps without root. abuild-apk is a setuid wrapper that
-          # requires the invoker to be in the `abuild` group; setup-
-          # alpine drops us in as `runner` which is not in that group
-          # by default. Adding the group here records it in /etc/group
-          # but the *current* shell still has stale supplementary
-          # groups — abuild-apk reads them via getgroups(2) at startup.
-          # `sg abuild -c '...'` spawns a subshell with the group
-          # active, which is what abuild-apk actually checks.
-          sudo addgroup runner abuild
-
-          # Wrap the whole abuild loop in one sg invocation so we pay
-          # the subshell-startup cost once. Single-quote the body so
-          # the parent shell doesn't try to expand $pkg/$name (those
-          # are local to the inner loop). $CARCH and $GITHUB_WORKSPACE
-          # are real env vars and survive the sg fork unchanged.
-          sg abuild -c '
-            set -eu
-            for pkg in main/*/; do
-              name=$(basename "$pkg")
-              echo "::group::abuild $name ($CARCH)"
-              # -F: force rebuild even when the apk seems up to date.
-              # -r: auto-install missing makedepends/checkdepends via
-              #     abuild-apk (which is now allowed because we ran
-              #     this loop inside sg abuild).
-              ( cd "$pkg" && CARCH="$CARCH" PATH="$GITHUB_WORKSPACE/.zig:$PATH" abuild -rF )
-              echo "::endgroup::"
-            done
-          '
+          # abuild's `-r` flag would auto-install build deps via
+          # abuild-apk, but that requires runner to be in the `abuild`
+          # group AND for the current shell to have already loaded
+          # that group (supplementary groups are loaded at process
+          # creation; getgroups(2) doesn't re-read /etc/group). The
+          # workarounds (sg, newgrp piped in, fresh-login shells) are
+          # all fragile in this environment.
+          #
+          # Cleaner: source each APKBUILD in a subshell to extract
+          # makedepends/checkdepends and pre-install them with
+          # `sudo apk add`. Then plain `abuild -F` works without ever
+          # needing the abuild group. abuild's -r is just a
+          # convenience around the same apk add; doing it explicitly
+          # is more transparent anyway.
+          for pkg in main/*/; do
+            name=$(basename "$pkg")
+            echo "::group::abuild $name ($CARCH)"
+            (
+              cd "$pkg"
+              # Subshell isolates APKBUILD's variable spew so it can't
+              # leak makedepends from one package into the next.
+              deps=$(
+                set +u
+                makedepends=""; checkdepends=""
+                . ./APKBUILD
+                printf '%s %s' "$makedepends" "$checkdepends"
+              )
+              # Strip the make/checkdepends-style "!options" tokens
+              # that abuild treats specially — apk would choke on them.
+              filtered=$(echo "$deps" | tr ' ' '\n' | grep -v '^!' | grep -v '^$' | sort -u | tr '\n' ' ')
+              if [ -n "$(echo "$filtered" | tr -d ' ')" ]; then
+                echo "+ sudo apk add $filtered"
+                # shellcheck disable=SC2086
+                sudo apk add --no-cache $filtered
+              fi
+              CARCH="$CARCH" PATH="$GITHUB_WORKSPACE/.zig:$PATH" abuild -F
+            )
+            echo "::endgroup::"
+          done
 
       - name: Collect APKs
         shell: alpine.sh {0}

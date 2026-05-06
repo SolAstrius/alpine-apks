@@ -26,36 +26,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Zig 0.16 isn't in Alpine 3.23's repos; we fetch the upstream
-      # static tarball and stash it in the workspace so the alpine
-      # chroot (which bind-mounts $GITHUB_WORKSPACE) can exec it.
+      # Zig 0.16 isn't in Alpine 3.23's repos; we install upstream into
+      # $GITHUB_WORKSPACE/.zig so the alpine chroot (bind-mounting the
+      # workspace) can exec it.
       #
-      # Cached by version: a single download serves every subsequent
-      # run until ZIG_VERSION bumps, and both matrix arches share the
-      # same key so only the first leg actually hits ziglang.org.
-      # Saves ~25s per leg per run, and dodges the periodic
-      # connection-reset failures we used to see on cold downloads.
+      # The fetch goes through the ZSF community-mirror network with
+      # minisign signature verification (see .github/scripts/fetch-zig.sh
+      # for the full protocol — it pins the ZSF pubkey and checks the
+      # `file=` trusted-comment field for downgrade-attack protection).
+      # ziglang.org itself isn't a hard dependency: if its mirror-list
+      # endpoint is down, the script falls back to a baked-in mirror
+      # list, so a single bad host can't sink the run.
+      #
+      # actions/cache makes the common case ~free: after one matrix leg
+      # populates `.zig/`, every subsequent run on either arch restores
+      # in seconds. Bumping ZIG_VERSION invalidates the key.
       - name: Cache Zig
         id: cache-zig
         uses: actions/cache@v4
         with:
           path: .zig
-          key: zig-0.16.0-x86_64-linux
+          key: zig-0.16.0-x86_64-linux-mirror-v1
 
-      - name: Stage Zig 0.16.0 into workspace
+      - name: Fetch Zig from community mirrors
         if: steps.cache-zig.outputs.cache-hit != 'true'
-        env:
-          ZIG_VERSION: 0.16.0
-        run: |
-          set -euo pipefail
-          url="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
-          # On cache miss, --retry handles the residual flakiness in
-          # ziglang.org. Cache hit is the common case after the first
-          # run with a given ZIG_VERSION populates the cache.
-          curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors "$url" \
-            | tar -xJ -C "$GITHUB_WORKSPACE"
-          mv "$GITHUB_WORKSPACE/zig-x86_64-linux-${ZIG_VERSION}" "$GITHUB_WORKSPACE/.zig"
-          "$GITHUB_WORKSPACE/.zig/zig" version
+        run: .github/scripts/fetch-zig.sh 0.16.0
 
       - name: Verify Zig (cache hit)
         if: steps.cache-zig.outputs.cache-hit == 'true'

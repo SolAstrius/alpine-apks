@@ -54,7 +54,10 @@ jobs:
 
       - name: Verify Zig (cache hit)
         if: steps.cache-zig.outputs.cache-hit == 'true'
-        run: "$GITHUB_WORKSPACE/.zig/zig" version
+        # Block scalar avoids YAML's "is this a quoted string?" hazard
+        # when the command contains literal double quotes.
+        run: |
+          "$GITHUB_WORKSPACE/.zig/zig" version
 
       - uses: jirutka/setup-alpine@v1
         with:

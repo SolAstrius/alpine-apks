@@ -224,7 +224,13 @@ pub const Client = struct {
             }
             try self.waitReadable(timeout_ms);
             const n = posix.read(self.fd, self.rx[self.rx_len..]) catch return Error.ReadFailed;
-            if (n == 0) return Error.Eof;
+            // VMIN=0 + poll() race: poll may report "readable" but the
+            // byte is gone by the time read() runs (e.g. because another
+            // reader on the same TTY consumed it, or the buffered byte
+            // was line-discipline-consumed). On a real EOF a serial
+            // port doesn't typically signal one anyway. Treat n=0 as a
+            // benign spurious wake — re-poll instead of bailing.
+            if (n == 0) continue;
             self.rx_len += n;
         }
     }

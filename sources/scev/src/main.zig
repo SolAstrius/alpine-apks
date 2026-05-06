@@ -75,6 +75,7 @@ fn runMain(init: std.process.Init.Minimal) !u8 {
     if (std.mem.eql(u8, cmd, "self")) return try cmdSelf(&client);
     if (std.mem.eql(u8, cmd, "find")) return try cmdFind(&client, rest.items);
     if (std.mem.eql(u8, cmd, "methods-like")) return try cmdMethodsLike(&client, rest.items);
+    if (std.mem.eql(u8, cmd, "queue")) return try cmdQueue(&client, rest.items);
 
     std.debug.print("scev: unknown subcommand '{s}'\n", .{cmd});
     printUsage();
@@ -129,6 +130,31 @@ fn cmdCall(c: *rpc.Client, rest: [][]const u8) !u8 {
         }
     };
     return runCall(c, rpc.METHOD_CALL, gen.emit, @ptrCast(&ctx), 15000);
+}
+
+/// `scev queue <event> [args...]` — inject a CC event into the
+/// computer's event queue. First arg is the event name (always a
+/// string); remaining args use the same `t:value` typed-prefix syntax
+/// as `scev call`. Mirrors `os.queueEvent` from the Lua side.
+fn cmdQueue(c: *rpc.Client, rest: [][]const u8) !u8 {
+    if (rest.len < 1) {
+        std.debug.print("usage: scev queue <event> [args...]\n", .{});
+        return 64;
+    }
+    var ctx = ArgsCtx{ .toks = rest };
+    const gen = struct {
+        fn emit(e: *mpack.Encoder, user: ?*anyopaque) anyerror!void {
+            const c2: *ArgsCtx = @ptrCast(@alignCast(user.?));
+            try e.arrayHeader(@intCast(c2.toks.len));
+            // Event name is always a string — bypass typed-arg parsing
+            // so a literal like "i:5" works as an event name if the
+            // user really wants. Subsequent args go through the typed
+            // prefix machinery exactly like `call` arguments.
+            try e.str(c2.toks[0]);
+            for (c2.toks[1..]) |tok| try emitTypedArg(e, tok);
+        }
+    };
+    return runCall(c, rpc.METHOD_QUEUE_EVENT, gen.emit, @ptrCast(&ctx), 5000);
 }
 
 /// `scev list` — CC's peripheral.getNames(), roughly.
@@ -222,16 +248,25 @@ fn cmdMethods(c: *rpc.Client, rest: [][]const u8) !u8 {
     return 0;
 }
 
-/// `scev type <peer>` — CC's peripheral.getType(name). Currently runs
-/// `scev list` under the hood and filters for the matching name;
-/// could be a dedicated RPC later if the cost shows up.
+/// `scev type <peer>` — CC's peripheral.getType(name). Hits the
+/// dedicated METHOD_TYPE on the host (cheaper than `list` + filter,
+/// and returns a richer map: peer/type/types/class[/remote]).
+///
+/// Output stays simple: one type per line, matching the C-era CLI.
 fn cmdType(c: *rpc.Client, rest: [][]const u8) !u8 {
     if (rest.len < 1) {
         std.debug.print("usage: scev type <peer>\n", .{});
         return 64;
     }
-    const want = rest[0];
-    const resp = c.call(rpc.METHOD_LIST, null, null, 5000) catch |e| {
+    var ctx = ArgsCtx{ .toks = rest };
+    const gen = struct {
+        fn emit(e: *mpack.Encoder, user: ?*anyopaque) anyerror!void {
+            const c2: *ArgsCtx = @ptrCast(@alignCast(user.?));
+            try e.arrayHeader(1);
+            try e.str(c2.toks[0]);
+        }
+    };
+    const resp = c.call(rpc.METHOD_TYPE, gen.emit, @ptrCast(&ctx), 5000) catch |e| {
         std.debug.print("scev: rpc error: {s}\n", .{@errorName(e)});
         return 1;
     };
@@ -240,44 +275,22 @@ fn cmdType(c: *rpc.Client, rest: [][]const u8) !u8 {
         return 2;
     }
     var dec = mpack.Decoder.init(resp.bytes);
-    const n = dec.readArrayHeader() catch return 1;
-    var i: u32 = 0;
-    while (i < n) : (i += 1) {
-        const m = dec.readMapHeader() catch return 1;
-        var peer: []const u8 = "";
-        var matched = false;
-        var types_buf: [256]u8 = undefined;
-        var types_pos: usize = 0;
-        var j: u32 = 0;
-        while (j < m) : (j += 1) {
-            const key = dec.readStr() catch return 1;
-            if (std.mem.eql(u8, key, "peer")) {
-                peer = dec.readStr() catch return 1;
-                matched = std.mem.eql(u8, peer, want);
-            } else if (std.mem.eql(u8, key, "types")) {
-                const tn = dec.readArrayHeader() catch return 1;
-                var tk: u32 = 0;
-                while (tk < tn) : (tk += 1) {
-                    const t = dec.readStr() catch return 1;
-                    if (tk != 0 and types_pos < types_buf.len) {
-                        types_buf[types_pos] = '\n';
-                        types_pos += 1;
-                    }
-                    const copy_n = @min(t.len, types_buf.len - types_pos);
-                    @memcpy(types_buf[types_pos .. types_pos + copy_n], t[0..copy_n]);
-                    types_pos += copy_n;
-                }
-            } else {
-                dec.skip() catch return 1;
+    const m = dec.readMapHeader() catch return 1;
+    var k: u32 = 0;
+    while (k < m) : (k += 1) {
+        const key = dec.readStr() catch return 1;
+        if (std.mem.eql(u8, key, "types")) {
+            const tn = dec.readArrayHeader() catch return 1;
+            var ti: u32 = 0;
+            while (ti < tn) : (ti += 1) {
+                const t = dec.readStr() catch return 1;
+                std.debug.print("{s}\n", .{t});
             }
-        }
-        if (matched) {
-            std.debug.print("{s}\n", .{types_buf[0..types_pos]});
-            return 0;
+        } else {
+            dec.skip() catch return 1;
         }
     }
-    std.debug.print("scev: no such peripheral: {s}\n", .{want});
-    return 2;
+    return 0;
 }
 
 /// `scev describe <peer> [method]` — reflection-derived signatures
@@ -945,6 +958,7 @@ fn printUsage() void {
         \\  methods-like <substring>       fuzzy-search method names across peripherals
         \\  describe <peer> [method]       reflection-derived signatures, grouped by class
         \\  call <peripheral> <method> ... call a peripheral method
+        \\  queue <event> [args...]        inject a CC event (typed args like `call`)
         \\  events [count]                 subscribe and print events
         \\  schema [event|clear]           observed event-argument shapes
         \\  trace [on|off|status|dump|clear]   dispatch-trace control

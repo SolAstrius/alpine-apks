@@ -19,3 +19,6 @@ APKINDEX.tar.gz
 # Private signing keys — only .rsa.pub belongs in git
 *.rsa
 !keys/*.rsa.pub
+
+# Claude Code session-local state
+.claude/

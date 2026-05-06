@@ -9,6 +9,18 @@ sources/*/zig-cache/
 sources/*/.zig-cache/
 sources/*/build/
 
+# Python build outputs / caches
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+sources/*/.dist/
+sources/*/dist/
+sources/*/build/
+sources/*/.pytest_cache/
+sources/*/.tox/
+sources/*/.venv/
+
 # abuild scratch + outputs
 .abuild/
 main/*/src/

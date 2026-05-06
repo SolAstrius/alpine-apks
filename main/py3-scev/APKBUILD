@@ -1,0 +1,38 @@
+# Contributor: Sol Astrius <sol@astrius.ink>
+# Maintainer: Sol Astrius <sol@astrius.ink>
+pkgname=py3-scev
+_pyname=scev
+pkgver=0.1.0
+pkgrel=0
+pkgdesc="Scalar Evolution guest RPC client (Python) + scev CLI"
+url="https://github.com/SolAstrius/alpine-apks"
+arch="noarch"
+license="MPL-2.0"
+depends="python3 py3-msgpack"
+makedepends="py3-gpep517 py3-hatchling py3-wheel py3-installer"
+checkdepends="py3-pytest"
+subpackages="$pkgname-pyc"
+options="!check"  # tests need a live host; CI just smoke-imports
+
+# In-tree source — the Python package lives at ../../sources/py-scev/
+# in this monorepo. Same `cp -r` trick we use for the Zig source.
+unpack() {
+	mkdir -p "$builddir"
+	cp -r "$startdir/../../sources/py-$_pyname/." "$builddir/"
+}
+
+build() {
+	# gpep517 reads pyproject.toml, dispatches to hatchling, drops the
+	# wheel into .dist/. --output-fd 3 redirects the wheel filename
+	# (gpep517's stdout) to fd 3 so the captured filename can be passed
+	# to installer; we don't need the filename here so we discard it.
+	gpep517 build-wheel \
+		--wheel-dir .dist \
+		--output-fd 3 3>/dev/null
+}
+
+package() {
+	# `python3 -m installer` is the canonical PEP 517 wheel installer
+	# for distros — drops site-packages into $pkgdir/usr/lib/...
+	python3 -m installer -d "$pkgdir" .dist/*.whl
+}

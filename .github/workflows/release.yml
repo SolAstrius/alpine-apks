@@ -88,9 +88,20 @@ jobs:
           set -eu
           out="$GITHUB_WORKSPACE/out/alpine/$ALPINE_BRANCH/$REPO_NAME/$CARCH"
           mkdir -p "$out"
-          # abuild outputs to $HOME/packages/<repo>/<arch>/*.apk where
-          # <repo> = parent dir of the APKBUILD's parent — here: "main".
-          find "$HOME/packages/$REPO_NAME/$CARCH" -name '*.apk' -exec cp {} "$out/" \;
+          # abuild outputs to $HOME/packages/<repo>/<arch>/*.apk for
+          # arch-specific packages, and <repo>/noarch/*.apk for any
+          # APKBUILD with arch="noarch" (e.g., py3-scev). Collect both:
+          # the matrix runs both x86_64 and riscv64 legs, so both will
+          # publish the same noarch .apk into their per-arch dest dir
+          # — the publish step dedupes naturally because the filenames
+          # match. Slight redundancy in CI for a much simpler pipeline
+          # than special-casing noarch.
+          if [ -d "$HOME/packages/$REPO_NAME/$CARCH" ]; then
+            find "$HOME/packages/$REPO_NAME/$CARCH" -name '*.apk' -exec cp {} "$out/" \;
+          fi
+          if [ -d "$HOME/packages/$REPO_NAME/noarch" ]; then
+            find "$HOME/packages/$REPO_NAME/noarch" -name '*.apk' -exec cp {} "$out/" \;
+          fi
           ls -la "$out"
 
       - uses: actions/upload-artifact@v4

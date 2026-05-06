@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "scev"
+version = "0.1.0"
+description = "Scalar Evolution guest RPC client (Python)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MPL-2.0"
+authors = [{ name = "Sol Astrius Phœnix", email = "sol@astrius.ink" }]
+keywords = ["scev", "scalar-evolution", "computercraft", "rpc", "msgpack"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Mozilla Public License 2.0 (MPL 2.0)",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: System :: Hardware",
+]
+dependencies = [
+    "msgpack>=1.0",
+]
+
+[project.scripts]
+# Console script is `scev-py`, not `scev` — the Zig binary owns
+# /usr/bin/scev and we want both installable side-by-side. The Python
+# CLI's main draw over the Zig one is the `j:<json>` typed-arg syntax
+# for tables; the library import surface (`import scev`) is the real
+# product anyway.
+scev-py = "scev.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/SolAstrius/alpine-apks"
+Source = "https://github.com/SolAstrius/alpine-apks/tree/main/sources/py-scev"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/scev"]

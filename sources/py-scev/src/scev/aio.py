@@ -206,12 +206,25 @@ class AsyncClient:
             if fut is None or fut.done():
                 return  # stale response
             err, result = arr[2], arr[3]
-            if err is None:
-                fut.set_result(result)
-            elif isinstance(err, str):
-                fut.set_exception(_rpc.RpcError(err))
+            try:
+                resolved = _rpc._unwrap_response(err, result)
+            except _rpc.RpcError as e:
+                fut.set_exception(e)
+            except _rpc.ProtocolError as e:
+                fut.set_exception(e)
             else:
-                fut.set_exception(_rpc.ProtocolError(f"non-string err: {err!r}"))
+                fut.set_result(resolved)
+        elif tag == _rpc.TAG_CHUNKED and len(arr) == 4:
+            rid = arr[1]
+            stream_id = arr[2]
+            total_size = arr[3]
+            fut = self._pending.pop(rid, None)
+            if fut is None or fut.done():
+                return  # caller already gave up
+            # Spawn a drain task — uses the existing call() machinery
+            # to issue read_chunk requests; resolves `fut` when the
+            # assembled bytes decode cleanly.
+            self._loop.create_task(self._drain_chunked(fut, stream_id, total_size))
         elif tag == _rpc.TAG_EVENT and len(arr) >= 3:
             name = arr[1]
             args = list(arr[2]) if isinstance(arr[2], (list, tuple)) else []
@@ -285,6 +298,84 @@ class AsyncClient:
         except asyncio.TimeoutError as e:
             self._pending.pop(rid, None)
             raise _rpc.Timeout from e
+
+    # ----------------------------------------------------------- chunked
+
+    async def _drain_chunked(
+        self,
+        original: asyncio.Future,
+        stream_id: int,
+        total_size: int,
+    ) -> None:
+        """Pull `total_size` bytes of `stream_id` via repeated
+        `read_chunk` calls and resolve `original` with the decoded
+        Response. Runs in its own task so the dispatch loop is free
+        to keep handling other frames (the read_chunk Responses
+        included). On any failure mid-drain, resolves `original` with
+        a synthetic `RpcError` so the caller's `await` doesn't hang."""
+        buf = bytearray()
+        offset = 0
+        slice_size = min(MAX_FRAME // 2, 32 * 1024)
+        try:
+            while offset < total_size:
+                want = min(slice_size, total_size - offset)
+                slice_bytes = await self.call(
+                    _rpc.METHOD_READ_CHUNK,
+                    [stream_id, offset, want],
+                    timeout=None,
+                )
+                if not isinstance(slice_bytes, (bytes, bytearray)):
+                    raise _rpc.ProtocolError(
+                        f"read_chunk returned non-bytes: {type(slice_bytes).__name__}"
+                    )
+                if not slice_bytes:
+                    raise _rpc.ProtocolError(
+                        f"chunked drain hit EOF at {offset}/{total_size}"
+                    )
+                buf.extend(slice_bytes)
+                offset += len(slice_bytes)
+        except _rpc.RpcError as e:
+            if not original.done():
+                original.set_exception(e)
+            return
+        except Exception as e:  # noqa: BLE001 — surface anything as a clean error
+            if not original.done():
+                original.set_exception(
+                    _rpc.RpcError(f"chunked drain failed: {e}", code=_rpc.ERR_GENERIC)
+                )
+            return
+
+        # Assembled bytes are exactly the original Response frame.
+        try:
+            arr = msgpack.unpackb(bytes(buf), raw=False, strict_map_key=False)
+        except Exception as e:
+            if not original.done():
+                original.set_exception(
+                    _rpc.ProtocolError(f"assembled buffer didn't decode: {e}")
+                )
+            return
+        if (
+            not isinstance(arr, (list, tuple))
+            or len(arr) != 4
+            or arr[0] != _rpc.TAG_RESPONSE
+        ):
+            if not original.done():
+                original.set_exception(
+                    _rpc.ProtocolError(f"chunked drain: not a Response: {arr!r}")
+                )
+            return
+        try:
+            resolved = _rpc._unwrap_response(arr[2], arr[3])
+        except _rpc.RpcError as e:
+            if not original.done():
+                original.set_exception(e)
+            return
+        except _rpc.ProtocolError as e:
+            if not original.done():
+                original.set_exception(e)
+            return
+        if not original.done():
+            original.set_result(resolved)
 
     # ----------------------------------------------------------- events
 

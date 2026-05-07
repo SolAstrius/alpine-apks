@@ -11,9 +11,20 @@ policy on corrupt frames.
 
 Wire format of a frame (after COBS decode):
     msgpack-array of:
-        [TAG_REQUEST,  id, method,  args]      — guest → host
-        [TAG_RESPONSE, id, err|nil, result]    — host → guest
-        [TAG_EVENT,        name,    args]      — host → guest, async
+        [TAG_REQUEST,   id, method,    args]            — guest → host
+        [TAG_RESPONSE,  id, err|nil,   result]          — host → guest
+        [TAG_EVENT,         name,      args]            — host → guest
+        [TAG_CHUNKED,   id, stream_id, total_size]      — host → guest
+
+The chunked-marker stands in for a Response whose encoded form
+exceeds MAX_FRAME. Drain via successive `read_chunk(stream_id, ...)`
+calls and decode the assembled buffer as a regular Response — handled
+transparently inside `call()` so callers don't see the chunking.
+
+The err slot of a Response is either `nil` (success), a structured
+map `{code, message}` (current host), or a bare string (legacy /
+forward-compat — wrapped as `{code: GENERIC, message: <str>}`). The
+`RpcError` exception always carries both `code` and `message`.
 """
 
 from __future__ import annotations
@@ -40,6 +51,7 @@ MAX_FRAME = 65536
 TAG_REQUEST = 0
 TAG_RESPONSE = 1
 TAG_EVENT = 2
+TAG_CHUNKED = 3
 
 # Method names — kept identical to the Zig const block in rpc.zig and
 # the Kotlin RpcProtocol object so all three clients agree on the
@@ -57,10 +69,39 @@ METHOD_SCHEMA = "schema"
 METHOD_TYPE = "type"
 METHOD_TRACE = "trace"
 METHOD_SELF = "self"
+METHOD_READ_CHUNK = "read_chunk"
+METHOD_DISCARD_CHUNK = "discard_chunk"
+
+
+# Error codes the host may emit in the structured err map. Treat
+# unknown codes as ERR_GENERIC for branching purposes; always show
+# `RpcError.message` to the user regardless.
+ERR_GENERIC = "rpc_error"
+ERR_BAD_ARGS = "bad_args"
+ERR_NO_SUCH_METHOD = "no_such_method"
+ERR_NO_SUCH_PEER = "no_such_peer"
+ERR_LUA_ERROR = "lua_error"
+ERR_RUNTIME_ERROR = "runtime_error"
+ERR_INTERNAL_ERROR = "internal_error"
+ERR_NOT_INSTALLED = "not_installed"
+ERR_UNSUPPORTED = "unsupported"
+ERR_FRAME_TOO_LARGE = "frame_too_large"
 
 
 class RpcError(Exception):
-    """Host returned an error response (msgpack string in the err slot)."""
+    """Host returned a structured error response.
+
+    `code` is one of the `ERR_*` constants (or a future-host code we
+    don't yet recognise — branch on it but don't assume the set is
+    closed). `message` is the human-readable form. The string
+    representation is `"<code>: <message>"` so existing logging that
+    just `str()`s the exception still surfaces both.
+    """
+
+    def __init__(self, message: str, code: str = ERR_GENERIC) -> None:
+        super().__init__(f"{code}: {message}" if code != ERR_GENERIC else message)
+        self.code = code
+        self.message = message
 
 
 class Timeout(Exception):
@@ -73,6 +114,32 @@ class FrameTooLarge(Exception):
 
 class ProtocolError(Exception):
     """Frame structure was wrong (wrong arity, missing fields, …)."""
+
+
+def _unwrap_response(err: Any, result: Any) -> Any:
+    """Resolve a (err, result) pair from a TAG_RESPONSE frame.
+
+    Returns `result` on success. Raises `RpcError` for any of the err
+    shapes the host might emit:
+     - `nil` → success (returns result)
+     - dict `{code, message}` → structured error
+     - bare string → wrapped as `RpcError(str, code=ERR_GENERIC)` for
+       legacy / forward-compat with anything still emitting strings.
+    Anything else surfaces as `ProtocolError`.
+    """
+    if err is None:
+        return result
+    if isinstance(err, dict):
+        code = err.get("code") or ERR_GENERIC
+        message = err.get("message") or ""
+        if not isinstance(code, str):
+            code = str(code)
+        if not isinstance(message, str):
+            message = str(message)
+        raise RpcError(message, code=code)
+    if isinstance(err, str):
+        raise RpcError(err, code=ERR_GENERIC)
+    raise ProtocolError(f"unrecognised err slot: {err!r}")
 
 
 class Client:
@@ -220,7 +287,8 @@ class Client:
     ) -> Any:
         """One round-trip. Discards interleaved events and stale
         responses until the response with our id arrives or `timeout`
-        seconds elapse."""
+        seconds elapse. Transparently drains chunked responses via
+        repeated `read_chunk` calls before returning."""
         rid = self._next_id
         self._next_id += 1
         self.send_request(rid, method, args)
@@ -234,6 +302,16 @@ class Client:
             if not isinstance(arr, (list, tuple)) or not arr:
                 continue
             tag = arr[0]
+            if tag == TAG_CHUNKED:
+                # [TAG_CHUNKED, response_id, stream_id, total_size]
+                if len(arr) != 4:
+                    raise ProtocolError(f"chunked arity {len(arr)}")
+                if arr[1] != rid:
+                    # Marker for someone else's call — drop. (Shouldn't
+                    # happen against the host because call() is
+                    # serial, but tolerant.)
+                    continue
+                return self._drain_chunked(arr[2], arr[3], deadline)
             if tag != TAG_RESPONSE:
                 # Event or malformed — keep waiting.
                 continue
@@ -243,13 +321,57 @@ class Client:
                 # Stale response from a previous call — drop and keep
                 # waiting for ours.
                 continue
-            err = arr[2]
-            result = arr[3]
-            if err is None:
-                return result
-            if isinstance(err, str):
-                raise RpcError(err)
-            raise ProtocolError(f"non-string err: {err!r}")
+            return _unwrap_response(arr[2], arr[3])
+
+    def _drain_chunked(
+        self,
+        stream_id: int,
+        total_size: int,
+        deadline: Optional[float],
+    ) -> Any:
+        """Pull `total_size` bytes of `stream_id` via repeated
+        `read_chunk` calls, decode the assembled buffer as a
+        Response, and return the unwrapped result. Raises `RpcError`
+        if the host responded with one — same exception shape as a
+        non-chunked call, so callers can't tell the difference."""
+        buf = bytearray()
+        offset = 0
+        # Keep slices well under MAX_FRAME so the read_chunk Response
+        # (a `bin` payload of slice_len bytes plus msgpack/cobs
+        # overhead) always fits in one wire frame.
+        slice_size = min(MAX_FRAME // 2, 32 * 1024)
+        while offset < total_size:
+            want = min(slice_size, total_size - offset)
+            remaining = (
+                None if deadline is None else max(0.0, deadline - time.monotonic())
+            )
+            slice_bytes = self.call(
+                METHOD_READ_CHUNK,
+                [stream_id, offset, want],
+                timeout=remaining,
+            )
+            if not isinstance(slice_bytes, (bytes, bytearray)):
+                raise ProtocolError(
+                    f"read_chunk returned non-bytes: {type(slice_bytes).__name__}"
+                )
+            if not slice_bytes:
+                raise ProtocolError(
+                    f"chunked drain hit EOF at {offset}/{total_size}"
+                )
+            buf.extend(slice_bytes)
+            offset += len(slice_bytes)
+        # Assembled bytes are exactly the original Response frame.
+        try:
+            arr = msgpack.unpackb(bytes(buf), raw=False, strict_map_key=False)
+        except Exception as e:
+            raise ProtocolError(f"chunked drain: assembled buffer didn't decode: {e}")
+        if (
+            not isinstance(arr, (list, tuple))
+            or len(arr) != 4
+            or arr[0] != TAG_RESPONSE
+        ):
+            raise ProtocolError(f"chunked drain: not a Response: {arr!r}")
+        return _unwrap_response(arr[2], arr[3])
 
     def recv_event(self, timeout: Optional[float] = None) -> tuple[str, list]:
         """Block until the next TAG_EVENT frame and return (name, args).

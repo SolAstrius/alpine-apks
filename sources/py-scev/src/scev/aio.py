@@ -38,14 +38,16 @@ from __future__ import annotations
 import asyncio
 import inspect
 import os
+import socket
 import termios
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Optional
 
 import msgpack
 
 from . import _cobs, _rpc
+from ._endpoint import Endpoint, resolve as _resolve_endpoint
 from .events import Event
 from .machine import MachineInfo
 from .peripheral import (
@@ -67,10 +69,13 @@ class AsyncClient:
     — only one coroutine ever calls os.read on the fd, so there's no
     contention on the rx accumulator."""
 
-    def __init__(self, fd: int) -> None:
+    def __init__(self, fd: int, transport: str = "serial") -> None:
         self.fd = fd
         self._rx = bytearray()
         self._next_id = 1
+        # Distinguishes serial (line-discipline + spurious 0-byte
+        # reads from VMIN/VTIME=0) from unix/tcp (real EOF on 0-byte).
+        self._transport = transport
         self._pending: dict[int, asyncio.Future[Any]] = {}
         # Each AsyncEventStream registers a queue here; the dispatcher
         # fans each TAG_EVENT frame out to all of them. Using bounded
@@ -80,20 +85,45 @@ class AsyncClient:
         self._loop = asyncio.get_running_loop()
         self._readable = asyncio.Event()
         self._closed = False
-        # Configure the tty before we start reading from it — same
-        # ritual as the sync Client (cfmakeraw, tcflush, leading 0x00).
-        self._set_raw()
-        self._flush_first_run()
+        # Serial only: configure the tty before we start reading from
+        # it (cfmakeraw, tcflush, leading 0x00). Sockets need none of
+        # this.
+        if transport == "serial":
+            self._set_raw()
+            self._flush_first_run()
         # Non-blocking fd; we'll wake on readable via add_reader.
         os.set_blocking(fd, False)
         self._loop.add_reader(fd, self._on_readable)
         self._reader_task = self._loop.create_task(self._reader_loop())
 
     @classmethod
-    async def open(cls, path: str = "/dev/ttyS1") -> "AsyncClient":
-        fd = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_CLOEXEC)
+    async def open(cls, endpoint: Optional[str | Endpoint] = None) -> "AsyncClient":
+        """Open a transport from an endpoint URI/Endpoint, or
+        auto-discover (SCEV_ENDPOINT > /run/scevd.sock > /dev/ttyS1)."""
+        ep = _resolve_endpoint(endpoint)
+        if ep.kind == "unix":
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                sock.connect(ep.path)
+            except OSError:
+                sock.close()
+                raise
+            fd = sock.detach()
+            return cls(fd, transport="unix")
+        if ep.kind == "tcp":
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                sock.connect((ep.host, ep.port))
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                sock.close()
+                raise
+            fd = sock.detach()
+            return cls(fd, transport="tcp")
+        # serial
+        fd = os.open(ep.path, os.O_RDWR | os.O_NOCTTY | os.O_CLOEXEC)
         try:
-            return cls(fd)
+            return cls(fd, transport="serial")
         except Exception:
             os.close(fd)
             raise
@@ -167,12 +197,18 @@ class AsyncClient:
                 except OSError:
                     return
                 if not chunk:
-                    # With VMIN=VTIME=0 raw mode, a 0-byte read is
-                    # "no data buffered right now", not end-of-file.
-                    # break out of the inner drain loop and re-arm
-                    # the readable event — there's nothing to do
-                    # until more data arrives. NOT a fatal condition.
-                    break
+                    if self._transport == "serial":
+                        # With VMIN=VTIME=0 raw mode, a 0-byte read is
+                        # "no data buffered right now", not EOF. Break
+                        # out of the inner drain loop and re-arm the
+                        # readable event — there's nothing to do until
+                        # more data arrives. NOT a fatal condition.
+                        break
+                    # On unix/tcp sockets, 0 bytes means the peer
+                    # (scevd) closed the connection. Stop the reader
+                    # task; close() will surface the disconnect to any
+                    # awaiting callers via the pending-future cleanup.
+                    return
                 self._rx.extend(chunk)
                 if len(self._rx) >= MAX_FRAME and 0 not in self._rx:
                     # Frame ran over cap with no delimiter — resync
@@ -536,17 +572,21 @@ class AsyncMachine:
     you). Constructing directly with the bare `AsyncMachine(path)`
     syntax is *not* supported — opening the serial fd is async."""
 
-    def __init__(self, _client: AsyncClient, _path: str | None) -> None:
+    def __init__(self, _client: AsyncClient, _endpoint: Optional[str | Endpoint] = None) -> None:
         self._client = _client
-        self._path = _path
+        self._endpoint = _endpoint
         self._peripheral_cache: dict[str, AsyncPeripheral] = {}
         self._class_cache: dict[tuple[str, ...], type[AsyncPeripheral]] = {}
 
     @classmethod
-    async def open(cls, path: str | None = None) -> "AsyncMachine":
-        target = path or os.environ.get("SCEV_SERIAL", "/dev/ttyS1")
-        client = await AsyncClient.open(target)
-        return cls(client, target)
+    async def open(cls, endpoint: Optional[str | Endpoint] = None) -> "AsyncMachine":
+        """Open the async client over the given endpoint, or auto-
+        discover. Accepts a URI string (`unix:///path`,
+        `tcp://host:port`, `serial:///dev/...`), a pre-built
+        [Endpoint][scev._endpoint.Endpoint], or None for default
+        discovery (SCEV_ENDPOINT > /run/scevd.sock > /dev/ttyS1)."""
+        client = await AsyncClient.open(endpoint)
+        return cls(client, endpoint)
 
     async def close(self) -> None:
         await self._client.close()
@@ -755,9 +795,13 @@ class AsyncMachine:
             self._client.unsubscribe_events(q)
 
 
-async def connect(path: str | None = None) -> AsyncMachine:
-    """Convenience constructor — `m = await scev.aio.connect()`."""
-    return await AsyncMachine.open(path)
+async def connect(endpoint: Optional[str | Endpoint] = None) -> AsyncMachine:
+    """Convenience constructor — `m = await scev.aio.connect()`.
+
+    Accepts the same endpoint forms as the sync `scev.connect()`:
+    `unix:///run/scevd.sock`, `tcp://host:port`, `serial:///dev/ttyS1`,
+    or a bare absolute path. None auto-discovers."""
+    return await AsyncMachine.open(endpoint)
 
 
 # ============================================================== AsyncRednet

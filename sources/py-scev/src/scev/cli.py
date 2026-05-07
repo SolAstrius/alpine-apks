@@ -260,8 +260,13 @@ def _print_usage() -> None:
         "  b:true    bool\n"
         "  n:        nil\n"
         "  j:<json>  JSON value (object/array — Python-only extension)\n"
+        "\nendpoint (--endpoint <URI> or SCEV_ENDPOINT env):\n"
+        "  unix:///run/scevd.sock     daemon UNIX socket (default if present)\n"
+        "  tcp://host:port            daemon TCP socket\n"
+        "  serial:///dev/ttyS1        direct serial (bypass daemon)\n"
         "\nenvironment:\n"
-        "  SCEV_SERIAL   override serial device (default /dev/ttyS1)\n"
+        "  SCEV_ENDPOINT   transport URI (overrides default discovery)\n"
+        "  SCEV_SERIAL     direct-serial fallback path (when no daemon)\n"
     )
 
 
@@ -291,11 +296,19 @@ def main(argv: list[str] | None = None) -> int:
         _print_usage()
         return 64
 
-    serial = os.environ.get("SCEV_SERIAL")
+    # --endpoint isn't a real flag here (we use a manual argv-walk for
+    # the typed positional args); pull it out via env or argv pre-scan.
+    endpoint = os.environ.get("SCEV_ENDPOINT")
+    if not endpoint and "--endpoint" in args:
+        i = args.index("--endpoint")
+        if i + 1 < len(args):
+            endpoint = args[i + 1]
+            del args[i : i + 2]
+            rest = args[2:]  # rest may have shifted
     try:
-        machine = Machine(serial)
-    except OSError as e:
-        return _err(f"cannot open {serial or '/dev/ttyS1'}: {e}")
+        machine = Machine(endpoint)
+    except (OSError, ValueError) as e:
+        return _err(f"cannot open {endpoint or 'default endpoint'}: {e}")
     try:
         return handler(machine, rest)
     except _rpc.RpcError as e:

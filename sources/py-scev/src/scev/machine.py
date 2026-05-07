@@ -63,11 +63,19 @@ class MachineInfo:
 
 class Machine:
     """Owns one Client. Sync, single in-flight request — wrap multiple
-    Machines if you need parallel RPC channels (one per ttyS device)."""
+    Machines if you need parallel RPC channels (one per endpoint).
 
-    def __init__(self, path: str | None = None) -> None:
-        path = path or os.environ.get("SCEV_SERIAL", "/dev/ttyS1")
-        self._client = _rpc.Client.open(path)
+    Connects via the system daemon at `/run/scevd.sock` by default
+    (auto-discovered); falls back to `/dev/ttyS1` direct serial when
+    the daemon isn't running. Override with the `endpoint` arg or
+    `SCEV_ENDPOINT` env. Backwards compat: passing a bare path string
+    (the old `path=` param) is still accepted — `/dev/...` routes to
+    serial, any other absolute path to a UNIX socket."""
+
+    def __init__(self, endpoint: str | None = None) -> None:
+        # Endpoint resolution (incl. SCEV_ENDPOINT / SCEV_SERIAL fallback)
+        # lives in `_endpoint.discover` — passing None lets it pick.
+        self._client = _rpc.Client.open(endpoint)
         self._peripheral_cache: dict[str, Peripheral] = {}
         # Class cache keyed by tuple-of-types — five identical
         # peripherals share the synthesized class; only the bound name
@@ -349,6 +357,11 @@ class PeripheralView(Mapping[str, Peripheral]):
         return self._m[key]
 
 
-def connect(path: str | None = None) -> Machine:
-    """Convenience constructor — `with scev.connect() as m: ...`."""
-    return Machine(path)
+def connect(endpoint: str | None = None) -> Machine:
+    """Convenience constructor — `with scev.connect() as m: ...`.
+
+    Auto-discovers the daemon socket / serial fallback when called
+    with no args. Accepts the same endpoint forms as the CLI:
+    `unix:///run/scevd.sock`, `tcp://host:port`, `serial:///dev/ttyS1`,
+    or a bare absolute path."""
+    return Machine(endpoint)

@@ -103,9 +103,27 @@ Same subcommand surface as the Zig binary (`ping`/`log`/`self`/
 scev-py call modem_0 transmit i:15 i:43 j:'{"hello":"world"}'
 ```
 
+## Transports
+
+`scev` and `AsyncMachine` connect via the system daemon at
+`/run/scevd.sock` by default (auto-discovered when the file exists),
+falling back to direct serial when no daemon is running. Override
+explicitly:
+
+```python
+scev.connect("unix:///run/scevd.sock")     # daemon UNIX socket
+scev.connect("tcp://10.0.0.5:5151")        # daemon TCP socket (no auth)
+scev.connect("serial:///dev/ttyS1")        # direct serial — bypass daemon
+```
+
+The CLI accepts the same forms via `--endpoint <URI>` or
+`SCEV_ENDPOINT`. Direct-serial mode loses events that arrive between
+client invocations; the daemon is the only transport that doesn't.
+
 ## Environment
 
-- `SCEV_SERIAL` — override serial path (default `/dev/ttyS1`).
+- `SCEV_ENDPOINT` — transport URI (overrides default discovery).
+- `SCEV_SERIAL` — direct-serial fallback path (default `/dev/ttyS1`).
 
 ## Wire compat
 

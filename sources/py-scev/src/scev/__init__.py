@@ -43,6 +43,7 @@ from __future__ import annotations
 # attribute submodules so `scev.colors.RED` and the British alias both
 # work without polluting the top-level namespace with 16 colour names.
 from . import aio, colors, colours
+from ._endpoint import Endpoint
 from ._rpc import (
     Client,
     FrameTooLarge,
@@ -87,7 +88,7 @@ from .aio import (
     AsyncRednet,
 )
 
-__version__ = "0.3.2"
+__version__ = "0.4.0"
 
 __all__ = [
     # version
@@ -100,6 +101,7 @@ __all__ = [
     # transport (low level)
     "Client",
     "AsyncClient",
+    "Endpoint",
     # sync API
     "Machine",
     "MachineInfo",

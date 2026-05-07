@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import os
 import select
+import socket
 import termios
 import time
 from typing import Any, Optional
@@ -38,6 +39,7 @@ from typing import Any, Optional
 import msgpack
 
 from . import _cobs
+from ._endpoint import Endpoint, resolve as _resolve_endpoint
 
 
 # Max plaintext frame size we'll accumulate or send. Mirrors the host's
@@ -145,23 +147,66 @@ def _unwrap_response(err: Any, result: Any) -> Any:
 
 
 class Client:
-    """Owns the serial fd. Not thread-safe — the host RPC is request/
-    response with one in-flight call at a time."""
+    """Owns one transport fd (serial / unix-socket / tcp-socket). Not
+    thread-safe — the host RPC is request/response with one in-flight
+    call at a time per Client.
 
-    def __init__(self, fd: int) -> None:
+    Transport is picked at open() time. The wire format on every
+    transport is identical (COBS+msgpack frames); the per-transport
+    differences are: serial needs raw-mode termios + the first-run
+    0x00 flush ritual, sockets don't; serial reads can return 0 bytes
+    spuriously (VMIN=0/VTIME=0), socket reads of 0 bytes mean EOF."""
+
+    def __init__(self, fd: int, transport: str = "serial") -> None:
         self.fd = fd
         self._rx = bytearray()
         self._next_id = 1
-        self._set_raw()
-        self._flush_first_run()
+        # Distinguishes serial (line-discipline + spurious 0-byte
+        # reads) from unix/tcp (real EOF on 0-byte read).
+        self._transport = transport
+        if transport == "serial":
+            self._set_raw()
+            self._flush_first_run()
 
     @classmethod
-    def open(cls, path: str = "/dev/ttyS1") -> "Client":
+    def open(cls, endpoint: Optional[str | Endpoint] = None) -> "Client":
+        """Open a transport from an endpoint URI/Endpoint, or
+        auto-discover. Default order: SCEV_ENDPOINT env, then
+        /run/scevd.sock if present, then /dev/ttyS1.
+
+        Backward compat: passing a bare path string (e.g.
+        ``"/dev/ttyS2"``) still works — the resolver routes it via
+        the same heuristic the Rust CLI uses (`/dev/*` → serial,
+        other absolute path → unix)."""
+        ep = _resolve_endpoint(endpoint)
+        if ep.kind == "unix":
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                sock.connect(ep.path)
+            except OSError:
+                sock.close()
+                raise
+            fd = sock.detach()
+            return cls(fd, transport="unix")
+        if ep.kind == "tcp":
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                sock.connect((ep.host, ep.port))
+                # Latency over throughput — call/response is small,
+                # frequent, and waiting on Nagle would inflate every
+                # round-trip by tens of ms.
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                sock.close()
+                raise
+            fd = sock.detach()
+            return cls(fd, transport="tcp")
+        # serial
         # NOCTTY so opening doesn't make this our controlling tty;
         # CLOEXEC so we don't leak the fd into any subprocess.
-        fd = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_CLOEXEC)
+        fd = os.open(ep.path, os.O_RDWR | os.O_NOCTTY | os.O_CLOEXEC)
         try:
-            return cls(fd)
+            return cls(fd, transport="serial")
         except Exception:
             os.close(fd)
             raise
@@ -259,13 +304,17 @@ class Client:
             self._wait_readable(deadline)
             chunk = os.read(self.fd, MAX_FRAME)
             if not chunk:
-                # With VMIN=VTIME=0 raw mode, os.read is allowed to
-                # return 0 bytes when no data is currently buffered —
-                # this is *not* EOF (a tty has no end-of-file in the
-                # usual sense; the remote can pause writing). Loop
-                # back to select. The deadline guards against
-                # busy-spinning if the host genuinely went away.
-                continue
+                if self._transport == "serial":
+                    # With VMIN=VTIME=0 raw mode, os.read is allowed to
+                    # return 0 bytes when no data is currently buffered
+                    # — this is *not* EOF (a tty has no end-of-file in
+                    # the usual sense; the remote can pause writing).
+                    # Loop back to select.
+                    continue
+                # For unix/tcp sockets, 0 bytes after a readable
+                # signal means the peer (scevd) closed the connection.
+                # Surface as a hard error so callers stop retrying.
+                raise ConnectionResetError("scevd disconnected")
             self._rx.extend(chunk)
 
     def _wait_readable(self, deadline: Optional[float]) -> None:

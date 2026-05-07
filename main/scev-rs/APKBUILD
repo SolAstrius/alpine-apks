@@ -2,7 +2,7 @@
 # Maintainer: Sol Astrius <sol@astrius.ink>
 pkgname=scev-rs
 pkgver=0.1.0
-pkgrel=0
+pkgrel=1
 pkgdesc="Scalar Evolution guest RPC CLI + scevd daemon (Rust)"
 url="https://github.com/SolAstrius/alpine-apks"
 arch="x86_64 riscv64"
@@ -21,6 +21,20 @@ options="!check !tracedeps !strip"
 
 # Subpackage: scevd binary + OpenRC init script.
 subpackages="scevd:_scevd"
+
+# Source manifest. Listing the install scripts here ties them to the
+# source checksum (so abuild flags drift if they're edited without a
+# pkgrel bump) and lets `abuild checksum` see them.
+source="
+	scevd.post-install
+	scevd.post-upgrade
+	scevd.pre-deinstall
+"
+sha512sums="
+ccee3f12686b0c6782de41c63cc11643e285fde5383a2ecf5174eb707f46ebcc426cde047f59e90219a6b90c1deb7197ce186aaaae8f2554037281581a7e6b1b  scevd.post-install
+39dab90865d609562df8765e145fb9aaa84350a6d405ab2dc93a2c06ca39a84a5249cd0f29dfb3ffb36711c6a63240cab567d8ebb0ad9f245e53b3d18b3bb682  scevd.post-upgrade
+c1aae7c2b28efc9f44d3ad639b47eb3f655e03dd411dec0bf40f6e9d41d1acb65c5e630d27aa955d8ea089cb69bdcfbaff6fd736d0629c270ddda191267a6bf7  scevd.pre-deinstall
+"
 
 # In-tree workspace at sources/scev-rs.
 unpack() {
@@ -66,6 +80,15 @@ _scevd() {
 	depends="openrc"
 	# Pull the scev CLI in as a soft dep — most users want both.
 	install_if="scev-rs"
+	# Lifecycle hooks: enrol scevd into the default runlevel on first
+	# install, restart it on upgrade if it was running, and stop +
+	# unenrol on deinstall. apk looks up the scripts by `<subpkg>.<phase>`
+	# convention — the files live next to APKBUILD.
+	install="
+		$subpkgname.post-install
+		$subpkgname.post-upgrade
+		$subpkgname.pre-deinstall
+	"
 
 	install -Dm755 "$builddir/_dist/scevd" "$subpkgdir/usr/bin/scevd"
 	install -Dm755 "$builddir/crates/scevd/openrc/scevd.initd" \

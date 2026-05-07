@@ -1,0 +1,23 @@
+#!/bin/sh
+# Post-install hook for the scevd subpackage. Runs after first install
+# (apk add scevd) — NOT on upgrades; that's `post-upgrade`'s job.
+#
+# We enrol scevd into the default runlevel so it comes up at boot
+# without the operator having to remember to. We do NOT start it
+# right now, because:
+#   * post-install runs in apk's chroot during first-time image
+#     builds (mkimage, lxc-create, etc.) where /run/openrc isn't
+#     mounted yet, so an attempt to `rc-service start` would noisily
+#     fail.
+#   * Operators upgrading on a live machine can `rc-service scevd
+#     restart` themselves — see the post-upgrade hook for the
+#     auto-restart we DO do there.
+#
+# rc-update is idempotent: re-enrolling an already-enrolled service
+# is a no-op + a one-line log message.
+
+if command -v rc-update >/dev/null 2>&1; then
+    rc-update add scevd default >/dev/null 2>&1 || true
+fi
+
+exit 0

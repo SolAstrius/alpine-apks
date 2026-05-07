@@ -1,0 +1,22 @@
+#!/bin/sh
+# Post-upgrade hook for the scevd subpackage. Runs after `apk upgrade`
+# (or `apk add` on an already-installed package) replaces the binary.
+#
+# Restart the daemon if it was running so the new binary actually
+# takes effect — without this the old code keeps serving requests on
+# the same socket until the next reboot, which is the opposite of
+# what an operator running `apk upgrade` expects.
+#
+# `rc-service ... status` exits 0 only when the service is currently
+# `started`; using it as a guard means we don't start a service the
+# operator had deliberately stopped. We tolerate the binary not being
+# in PATH (chroot-time upgrades) and the runlevel system not being
+# alive (image builds).
+
+if command -v rc-service >/dev/null 2>&1; then
+    if rc-service scevd status >/dev/null 2>&1; then
+        rc-service scevd restart >/dev/null 2>&1 || true
+    fi
+fi
+
+exit 0

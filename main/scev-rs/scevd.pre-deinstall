@@ -1,0 +1,24 @@
+#!/bin/sh
+# Pre-deinstall hook for the scevd subpackage. Runs before the binary
+# and init script are removed by `apk del scevd`.
+#
+# Tear the daemon down cleanly so we don't leak /run/scevd.sock or
+# the supervise-daemon process onto a system that no longer has the
+# /usr/bin/scevd it's supervising. Order matters: stop first (so the
+# pidfile is reaped while the binary still exists), then drop the
+# runlevel enrolment (so a subsequent reinstall doesn't get a
+# duplicate entry).
+#
+# We tolerate every step failing — the user might have already
+# stopped the service, the runlevel system might not be alive
+# (chroot-time deinstall), or rc-update might not be installed.
+
+if command -v rc-service >/dev/null 2>&1; then
+    rc-service scevd stop >/dev/null 2>&1 || true
+fi
+
+if command -v rc-update >/dev/null 2>&1; then
+    rc-update del scevd default >/dev/null 2>&1 || true
+fi
+
+exit 0

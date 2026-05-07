@@ -47,17 +47,33 @@ jobs:
           path: |
             .rustup
             .cargo
-          key: rust-${{ hashFiles('sources/scev-rs/rust-toolchain.toml') }}-v2
+          # Bump the suffix when the install shape changes (host
+          # triple, default-host, profile, …) so old caches don't
+          # poison new runs.
+          key: rust-musl-${{ hashFiles('sources/scev-rs/rust-toolchain.toml') }}-v3
 
-      - name: Install Rust
+      - name: Install Rust (musl host)
         if: steps.cache-rust.outputs.cache-hit != 'true'
         env:
           RUSTUP_HOME: ${{ github.workspace }}/.rustup
           CARGO_HOME: ${{ github.workspace }}/.cargo
         run: |
           set -euo pipefail
+          # `--default-host x86_64-unknown-linux-musl` is the load-bearing
+          # bit: the ubuntu-latest runner is glibc, but the alpine-sdk
+          # chroot the build step runs in is musl, and glibc rust
+          # binaries don't exec under a musl loader (no fallback;
+          # gcompat would patch around it but that's another moving
+          # part). Installing rustc itself as musl-static lets the same
+          # toolchain run in both contexts: we drive cargo from inside
+          # the chroot via APKBUILD, but the rustup metadata commands
+          # also need to work on the host before `setup-alpine`.
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- --default-toolchain none --profile minimal -y
+            | sh -s -- \
+                --default-toolchain none \
+                --default-host x86_64-unknown-linux-musl \
+                --profile minimal \
+                -y
           export PATH="$CARGO_HOME/bin:$PATH"
           # First invocation in the workspace dir installs the pinned
           # toolchain + both musl targets per rust-toolchain.toml.

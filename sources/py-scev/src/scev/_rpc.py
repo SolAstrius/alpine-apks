@@ -74,6 +74,7 @@ METHOD_SELF = "self"
 METHOD_READ_CHUNK = "read_chunk"
 METHOD_DISCARD_CHUNK = "discard_chunk"
 METHOD_BATCH = "batch"
+METHOD_BATCH_PAR = "batch_par"
 
 
 # Error codes the host may emit in the structured err map. Treat

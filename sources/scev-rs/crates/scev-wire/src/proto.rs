@@ -59,6 +59,11 @@ pub mod methods {
     /// `(items: array<[method, args]>, opts?: { stop_on_error: bool })
     /// -> array<[err_or_nil, result_or_nil]>`.
     pub const BATCH: &str = "batch";
+    /// Parallel batch dispatch — same envelope as [`BATCH`] but items
+    /// run concurrently. Same-peripheral calls still serialise (host
+    /// holds a per-peer mutex); cross-peripheral calls actually fan
+    /// out. Always runs every item; `stop_on_error` doesn't apply.
+    pub const BATCH_PAR: &str = "batch_par";
 }
 
 /// Stable string codes the host emits in the structured error map.

@@ -2,11 +2,20 @@
 # Maintainer: Sol Astrius <sol@astrius.ink>
 pkgname=scev-rs
 pkgver=0.1.0
-pkgrel=1
+pkgrel=2
 pkgdesc="Scalar Evolution guest RPC CLI + scevd daemon (Rust)"
 url="https://github.com/SolAstrius/alpine-apks"
 arch="x86_64 riscv64"
 license="MPL-2.0"
+
+# Drop-in replacement for the retired Zig package `scev`. Without this,
+# `apk add scev-rs` on a host that still has scev-0.1.2 installed
+# fails with "trying to overwrite usr/bin/scev owned by scev". The
+# replaces= field tells apk it's allowed to take ownership of those
+# paths from the named package, and `provides` makes scev-rs a
+# satisfier for any reverse-dep that still asks for `scev`.
+provides="scev=$pkgver-r$pkgrel"
+replaces="scev"
 # Rust toolchain comes from outside the chroot — see release.yml for the
 # rustup install. We don't list `cargo` in makedepends because Alpine
 # 3.23's rust is too old for the workspace's edition2024 deps; the GHA

@@ -6,16 +6,40 @@ name="scevd"
 description="Scalar Evolution guest RPC multiplexer"
 command="/usr/bin/scevd"
 command_args="${SCEVD_OPTS:-}"
-command_background="yes"
 pidfile="/run/${RC_SVCNAME}.pid"
 output_log="/var/log/${RC_SVCNAME}.log"
 error_log="/var/log/${RC_SVCNAME}.log"
+
+# Use supervise-daemon so OpenRC actively monitors the process and
+# restarts it on crash. start-stop-daemon (the OpenRC default) only
+# launches once and walks away — a SIGKILL'd scevd would leave the
+# guest's CLI hanging forever on /run/scevd.sock with no /run/scevd.pid
+# to even tell rc-service the daemon is gone.
+supervisor="supervise-daemon"
+respawn_delay=2
+respawn_max=5
+respawn_period=60
 
 # scevd needs read+write access to the serial device. Default Alpine
 # ttyS perms are root:root 0660; we run as root for now and drop to a
 # `scevd` group later once the daemon is hardened. The group setup is
 # handled by the post-install hook in the APKBUILD.
 depend() {
+    # need: scevd is useless without a working tmpfs for /run and
+    # /var/log already mounted.
     need localmount
+    # after bootmisc: /var/log is created in bootmisc, and we depend
+    # on a stable hostname for the tracing-subscriber output.
     after bootmisc
+    # before any service that wants to talk to the host RPC. Most
+    # consumers are user shell sessions, but if a future scev-using
+    # daemon shows up it shouldn't race the socket.
+    provide scev-rpc
+}
+
+start_pre() {
+    # Make sure the log file exists with sane perms before scevd
+    # daemonizes — supervise-daemon redirects stdout/stderr there
+    # before it can chmod.
+    checkpath --file --owner root:root --mode 0640 "$output_log"
 }

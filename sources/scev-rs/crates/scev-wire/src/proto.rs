@@ -53,6 +53,12 @@ pub mod methods {
     pub const READ_CHUNK: &str = "read_chunk";
     /// Discard a chunked response early. Args: `(stream_id: int) -> bool`.
     pub const DISCARD_CHUNK: &str = "discard_chunk";
+    /// Ordered batch dispatch — runs N `(method, args)` pairs serially
+    /// on the host in one request, returning per-item `[err, result]`
+    /// envelopes in input order. Args:
+    /// `(items: array<[method, args]>, opts?: { stop_on_error: bool })
+    /// -> array<[err_or_nil, result_or_nil]>`.
+    pub const BATCH: &str = "batch";
 }
 
 /// Stable string codes the host emits in the structured error map.
@@ -70,4 +76,7 @@ pub mod errors {
     pub const NOT_INSTALLED: &str = "not_installed";
     pub const UNSUPPORTED: &str = "unsupported";
     pub const FRAME_TOO_LARGE: &str = "frame_too_large";
+    /// Item slot in a `batch` response that didn't run because an
+    /// earlier item errored and `stop_on_error` was set.
+    pub const SKIPPED: &str = "skipped";
 }

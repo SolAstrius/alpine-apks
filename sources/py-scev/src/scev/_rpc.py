@@ -71,6 +71,7 @@ METHOD_TRACE = "trace"
 METHOD_SELF = "self"
 METHOD_READ_CHUNK = "read_chunk"
 METHOD_DISCARD_CHUNK = "discard_chunk"
+METHOD_BATCH = "batch"
 
 
 # Error codes the host may emit in the structured err map. Treat
@@ -86,6 +87,7 @@ ERR_INTERNAL_ERROR = "internal_error"
 ERR_NOT_INSTALLED = "not_installed"
 ERR_UNSUPPORTED = "unsupported"
 ERR_FRAME_TOO_LARGE = "frame_too_large"
+ERR_SKIPPED = "skipped"
 
 
 class RpcError(Exception):

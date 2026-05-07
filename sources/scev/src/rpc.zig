@@ -16,7 +16,12 @@ const c = std.c;
 const cobs = @import("cobs.zig");
 const mpack = @import("mpack.zig");
 
-pub const MAX_FRAME: usize = 8192;
+/// Max plaintext frame size we'll accumulate or send. Mirrors the
+/// host's `ScevRpcManager.MAX_FRAME_BYTES`; the guest can read the
+/// authoritative value from `self.frame_max_bytes` if it cares about
+/// adapting per-host. Sized so the three Client buffers (rx, decoded,
+/// encoded) fit comfortably within musl's default 8 MiB stack.
+pub const MAX_FRAME: usize = 65536;
 
 pub const TAG_REQUEST: i64 = 0;
 pub const TAG_RESPONSE: i64 = 1;

@@ -1,0 +1,21 @@
+#!/sbin/openrc-run
+# OpenRC service for scevd. Alpine ships OpenRC by default; this is the
+# init script the APKBUILD installs into /etc/init.d/scevd.
+
+name="scevd"
+description="Scalar Evolution guest RPC multiplexer"
+command="/usr/bin/scevd"
+command_args="${SCEVD_OPTS:-}"
+command_background="yes"
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/${RC_SVCNAME}.log"
+error_log="/var/log/${RC_SVCNAME}.log"
+
+# scevd needs read+write access to the serial device. Default Alpine
+# ttyS perms are root:root 0660; we run as root for now and drop to a
+# `scevd` group later once the daemon is hardened. The group setup is
+# handled by the post-install hook in the APKBUILD.
+depend() {
+    need localmount
+    after bootmisc
+}

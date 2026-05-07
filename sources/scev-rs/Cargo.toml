@@ -1,0 +1,61 @@
+# Cargo workspace for the Rust port of the scev guest tooling.
+#
+# Three crates:
+#   scev-wire — codec + frame types (cobs + msgpack), shared by client/daemon
+#   scev      — guest CLI (subcommand-compatible with the Zig binary)
+#   scevd     — system-wide daemon: owns /dev/ttyS1, fans out to UNIX-socket
+#               clients at /run/scevd.sock, buffers events.
+#
+# Targets: x86_64-unknown-linux-musl (host build, statically linked) and
+# riscv64gc-unknown-linux-musl (cross-compiled). Both via cargo-zigbuild —
+# the existing .github/scripts/fetch-zig.sh fetch already gives us the
+# linker we need.
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/scev-wire",
+    "crates/scev",
+    "crates/scevd",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+authors = ["Sol Astrius Phœnix <sol@astrius.ink>"]
+repository = "https://github.com/SolAstrius/alpine-apks"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Codec building blocks. `cobs` is no_std and stable; `rmp` / `rmpv` cover
+# the msgpack subset the wire uses (rmpv's Value type carries the
+# heterogeneous shapes from `describe`/event args without per-call structs).
+cobs = "0.3"
+rmp = "0.8"
+rmpv = "1.3"
+rmp-serde = "1.3"
+serde = { version = "1", features = ["derive"] }
+
+# Daemon-side
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "signal", "time", "fs"] }
+tokio-serial = "5"
+tokio-util = { version = "0.7", features = ["codec"] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Diagnostics
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+# Static musl + size-optimized: ship the smallest binary we can without
+# losing async perf. fat LTO + abort-on-panic + single codegen unit
+# trades compile time for a few hundred KB on disk.
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

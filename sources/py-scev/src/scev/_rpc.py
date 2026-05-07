@@ -29,7 +29,13 @@ import msgpack
 from . import _cobs
 
 
-MAX_FRAME = 8192
+# Max plaintext frame size we'll accumulate or send. Mirrors the host's
+# `ScevRpcManager.MAX_FRAME_BYTES`; clients that want to adapt per-host
+# can read the authoritative value from the `self` RPC's
+# `frame_max_bytes` field. This constant is the upper bound the codec is
+# willing to allocate for, sized to accommodate `describe`/`schema`
+# payloads and rich event args without splitting frames.
+MAX_FRAME = 65536
 
 TAG_REQUEST = 0
 TAG_RESPONSE = 1

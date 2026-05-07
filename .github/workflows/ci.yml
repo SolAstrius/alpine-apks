@@ -27,6 +27,35 @@ jobs:
       - run: zig version && zig build test
         working-directory: sources/scev
 
+  cargo-test:
+    name: cargo test (sources/scev-rs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rustup picks the toolchain from sources/scev-rs/rust-toolchain.toml
+      # automatically the first time it's invoked from inside that dir.
+      - name: Install Rust
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- --default-toolchain none --profile minimal -y
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Cache cargo registry + workspace target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            sources/scev-rs/target
+          key: cargo-test-${{ hashFiles('sources/scev-rs/Cargo.lock', 'sources/scev-rs/rust-toolchain.toml') }}
+          restore-keys: |
+            cargo-test-
+
+      - run: cargo test --workspace
+        working-directory: sources/scev-rs
+
   apkbuild-lint:
     name: apkbuild-lint
     runs-on: ubuntu-latest

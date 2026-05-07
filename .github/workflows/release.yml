@@ -59,6 +59,52 @@ jobs:
         run: |
           "$GITHUB_WORKSPACE/.zig/zig" version
 
+      # Rust toolchain + cargo-zigbuild for the Rust workspace
+      # (sources/scev-rs). RUSTUP_HOME and CARGO_HOME live inside
+      # $GITHUB_WORKSPACE so the alpine chroot (which bind-mounts the
+      # workspace) can see them; the chroot's build step prepends
+      # .cargo/bin to PATH the same way it does for .zig.
+      #
+      # Cache key bumps with rust-toolchain.toml — touching the pinned
+      # channel forces a re-install. cargo-zigbuild itself is cached
+      # under the same key (it lives in $CARGO_HOME/bin).
+      - name: Cache Rust toolchain
+        id: cache-rust
+        uses: actions/cache@v4
+        with:
+          path: |
+            .rustup
+            .cargo
+          key: rust-${{ hashFiles('sources/scev-rs/rust-toolchain.toml') }}-zigbuild-v1
+
+      - name: Install Rust + cargo-zigbuild
+        if: steps.cache-rust.outputs.cache-hit != 'true'
+        env:
+          RUSTUP_HOME: ${{ github.workspace }}/.rustup
+          CARGO_HOME: ${{ github.workspace }}/.cargo
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- --default-toolchain none --profile minimal -y
+          export PATH="$CARGO_HOME/bin:$PATH"
+          # First invocation in the workspace dir installs the pinned
+          # toolchain + both musl targets per rust-toolchain.toml.
+          (cd sources/scev-rs && rustc --version)
+          # cargo-zigbuild bridges cargo + zig-as-linker for cross-musl.
+          # `--locked` would need a Cargo.lock for the cargo-zigbuild
+          # crate itself, which we don't ship; rely on the cache key
+          # to avoid re-installs when nothing changed.
+          cargo install cargo-zigbuild --version '^0.20'
+
+      - name: Verify Rust (cache hit)
+        if: steps.cache-rust.outputs.cache-hit == 'true'
+        env:
+          RUSTUP_HOME: ${{ github.workspace }}/.rustup
+          CARGO_HOME: ${{ github.workspace }}/.cargo
+        run: |
+          "$CARGO_HOME/bin/rustc" --version
+          "$CARGO_HOME/bin/cargo-zigbuild" --version
+
       - uses: jirutka/setup-alpine@v1
         with:
           branch: ${{ env.ALPINE_BRANCH }}
@@ -71,8 +117,14 @@ jobs:
           ABUILD_PRIVKEY: ${{ secrets.ABUILD_PRIVKEY }}
         run: |
           set -eu
-          export PATH="$GITHUB_WORKSPACE/.zig:$PATH"
+          # Zig (linker for cargo-zigbuild + the existing scev Zig
+          # build) and Rust both live in the bind-mounted workspace.
+          export PATH="$GITHUB_WORKSPACE/.zig:$GITHUB_WORKSPACE/.cargo/bin:$PATH"
+          export RUSTUP_HOME="$GITHUB_WORKSPACE/.rustup"
+          export CARGO_HOME="$GITHUB_WORKSPACE/.cargo"
           zig version
+          rustc --version || true
+          cargo-zigbuild --version || true
 
           # abuild refuses to run as root — set up keys under the runner
           # user's HOME which setup-alpine drops us into.

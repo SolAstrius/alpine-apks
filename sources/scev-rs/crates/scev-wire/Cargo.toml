@@ -1,0 +1,19 @@
+[package]
+name = "scev-wire"
+description = "Frame codec + RPC protocol constants for the scev guest channel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cobs.workspace = true
+rmp.workspace = true
+rmpv.workspace = true
+rmp-serde.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+bytes = "1"
+tokio-util = { workspace = true }

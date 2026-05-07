@@ -1,0 +1,26 @@
+[package]
+name = "scevd"
+description = "System-wide multiplexer for the scev guest serial RPC"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "scevd"
+path = "src/main.rs"
+
+[dependencies]
+scev-wire = { path = "../scev-wire" }
+tokio.workspace = true
+tokio-serial.workspace = true
+tokio-util.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+rmpv.workspace = true
+futures = "0.3"

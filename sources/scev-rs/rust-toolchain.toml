@@ -1,0 +1,11 @@
+# Pinned toolchain — keeps local devshell, CI, and Alpine-chroot builds
+# in lockstep. Bump deliberately; the `cargo-zigbuild` cross paths are
+# stable enough that point releases of stable rust don't normally require
+# any matching workflow change.
+[toolchain]
+channel = "1.85.0"
+components = ["rustfmt", "clippy"]
+targets = [
+    "x86_64-unknown-linux-musl",
+    "riscv64gc-unknown-linux-musl",
+]

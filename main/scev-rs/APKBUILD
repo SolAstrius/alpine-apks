@@ -1,0 +1,64 @@
+# Contributor: Sol Astrius <sol@astrius.ink>
+# Maintainer: Sol Astrius <sol@astrius.ink>
+pkgname=scev-rs
+pkgver=0.1.0
+pkgrel=0
+pkgdesc="Scalar Evolution guest RPC CLI + scevd daemon (Rust)"
+url="https://github.com/SolAstrius/alpine-apks"
+arch="x86_64 riscv64"
+license="MPL-2.0"
+# Rust toolchain + linker come from outside the chroot — see the
+# release.yml workflow for the rustup install + cargo-zigbuild setup.
+# We don't list `cargo` in makedepends because Alpine 3.23's rust is
+# too old for the workspace's edition2024 deps; the GHA workflow ships
+# its own pinned toolchain via $GITHUB_WORKSPACE/.cargo.
+# !check  — `cargo test` runs in the cargo-test CI job, not during apk build
+# !tracedeps — both binaries are statically linked musl
+# !strip  — release profile already strips
+options="!check !tracedeps !strip"
+
+# Subpackage: scevd binary + OpenRC init script. abuild's subpackage
+# format is `name[:func[:arch]]`; we use a custom function name so the
+# subpackage isn't named with the parent's prefix.
+subpackages="scevd:_scevd"
+
+# In-tree workspace at sources/scev-rs.
+unpack() {
+	mkdir -p "$builddir"
+	cp -r "$startdir/../../sources/scev-rs/." "$builddir/"
+}
+
+build() {
+	case "$CARCH" in
+		x86_64)  cargo_target="x86_64-unknown-linux-musl"  ;;
+		riscv64) cargo_target="riscv64gc-unknown-linux-musl" ;;
+		*) error "unsupported CARCH=$CARCH"; return 1 ;;
+	esac
+	# `cargo zigbuild` uses the existing Zig install (already on PATH
+	# from the same fetch-zig.sh the Zig packages use) as the musl
+	# linker. No GCC cross-toolchains needed.
+	cargo zigbuild --release --target "$cargo_target" --workspace
+	# Stash the target dir so package() functions can find the binaries.
+	mkdir -p "$builddir/_dist"
+	cp "target/$cargo_target/release/scev"  "$builddir/_dist/"
+	cp "target/$cargo_target/release/scevd" "$builddir/_dist/"
+}
+
+package() {
+	# Main package gets just the CLI; scevd lives in the subpackage so
+	# users that only want the client (most of them) don't pay for the
+	# daemon's tokio/serial deps in storage.
+	install -Dm755 "$builddir/_dist/scev" "$pkgdir/usr/bin/scev"
+}
+
+_scevd() {
+	pkgdesc="System-wide multiplexer for the scev guest serial RPC"
+	depends="openrc"
+	# Pull the scev CLI in as a soft dep — most users want both. Hard
+	# dep would force install order, which OpenRC scripts don't need.
+	install_if="scev-rs"
+
+	install -Dm755 "$builddir/_dist/scevd" "$subpkgdir/usr/bin/scevd"
+	install -Dm755 "$builddir/crates/scevd/openrc/scevd.initd" \
+		"$subpkgdir/etc/init.d/scevd"
+}

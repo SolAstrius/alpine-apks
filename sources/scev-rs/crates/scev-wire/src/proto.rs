@@ -64,6 +64,10 @@ pub mod methods {
     /// holds a per-peer mutex); cross-peripheral calls actually fan
     /// out. Always runs every item; `stop_on_error` doesn't apply.
     pub const BATCH_PAR: &str = "batch_par";
+    /// Cancel an in-flight request by id. Args: `(id: int) -> {cancelled: bool}`.
+    /// Returns `{cancelled: false}` for unknown ids (already done /
+    /// never existed) — idempotent.
+    pub const CANCEL: &str = "cancel";
 }
 
 /// Stable string codes the host emits in the structured error map.

@@ -1,0 +1,27 @@
+# Cross-compile config — uses rust-lld (rustup ships it under each
+# toolchain's sysroot at lib/rustlib/<host>/bin/rust-lld) plus
+# `link-self-contained=yes` to pull in rust's own musl libc + crt
+# artefacts. No external linker, gcc cross-toolchain, or zig install
+# required — works on any host that has rustup.
+#
+# `linker = "rust-lld"` does a PATH lookup, so the build script /
+# APKBUILD must add the toolchain sysroot bin dir to PATH before
+# invoking cargo. The Makefile target below does this; the APKBUILD's
+# build() does the same for packaged builds.
+
+[target.x86_64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "link-self-contained=yes"]
+
+[target.riscv64gc-unknown-linux-musl]
+linker = "rust-lld"
+# Empty libgcc_s.a stub: rust's riscv64gc-musl target spec emits
+# `-lgcc_s` in its post-link args (a long-standing wart — rust ships
+# its own compiler_builtins, but the link line still asks for gcc_s).
+# With `link-self-contained=yes` the toolchain provides every other
+# crt artefact, so a zero-symbol archive in the search path is enough
+# to satisfy the linker. See .cargo/riscv64gc-musl-stubs/libgcc_s.a.
+rustflags = [
+    "-C", "link-self-contained=yes",
+    "-L", "native=.cargo/riscv64gc-musl-stubs",
+]

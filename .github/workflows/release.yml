@@ -26,48 +26,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Zig 0.16 isn't in Alpine 3.23's repos; we install upstream into
-      # $GITHUB_WORKSPACE/.zig so the alpine chroot (bind-mounting the
-      # workspace) can exec it.
+      # Rust toolchain for the workspace at sources/scev-rs.
+      # RUSTUP_HOME and CARGO_HOME live inside $GITHUB_WORKSPACE so the
+      # alpine chroot (which bind-mounts the workspace) can exec them;
+      # the chroot's build step prepends $CARGO_HOME/bin to PATH.
       #
-      # The fetch goes through the ZSF community-mirror network with
-      # minisign signature verification (see .github/scripts/fetch-zig.sh
-      # for the full protocol — it pins the ZSF pubkey and checks the
-      # `file=` trusted-comment field for downgrade-attack protection).
-      # ziglang.org itself isn't a hard dependency: if its mirror-list
-      # endpoint is down, the script falls back to a baked-in mirror
-      # list, so a single bad host can't sink the run.
-      #
-      # actions/cache makes the common case ~free: after one matrix leg
-      # populates `.zig/`, every subsequent run on either arch restores
-      # in seconds. Bumping ZIG_VERSION invalidates the key.
-      - name: Cache Zig
-        id: cache-zig
-        uses: actions/cache@v4
-        with:
-          path: .zig
-          key: zig-0.16.0-x86_64-linux-mirror-v1
-
-      - name: Fetch Zig from community mirrors
-        if: steps.cache-zig.outputs.cache-hit != 'true'
-        run: .github/scripts/fetch-zig.sh 0.16.0
-
-      - name: Verify Zig (cache hit)
-        if: steps.cache-zig.outputs.cache-hit == 'true'
-        # Block scalar avoids YAML's "is this a quoted string?" hazard
-        # when the command contains literal double quotes.
-        run: |
-          "$GITHUB_WORKSPACE/.zig/zig" version
-
-      # Rust toolchain + cargo-zigbuild for the Rust workspace
-      # (sources/scev-rs). RUSTUP_HOME and CARGO_HOME live inside
-      # $GITHUB_WORKSPACE so the alpine chroot (which bind-mounts the
-      # workspace) can see them; the chroot's build step prepends
-      # .cargo/bin to PATH the same way it does for .zig.
+      # Cross-compilation: we use `rust-lld` (the bundled LLVM linker
+      # rustup ships under each toolchain's sysroot) plus
+      # `-Clink-self-contained=yes` to pull in rust's own musl libc and
+      # crt artefacts. That's enough to build a static-musl binary for
+      # both x86_64 and riscv64gc without any external linker, gcc
+      # cross-toolchain, or zig install.
       #
       # Cache key bumps with rust-toolchain.toml — touching the pinned
-      # channel forces a re-install. cargo-zigbuild itself is cached
-      # under the same key (it lives in $CARGO_HOME/bin).
+      # channel forces a re-install.
       - name: Cache Rust toolchain
         id: cache-rust
         uses: actions/cache@v4
@@ -75,9 +47,9 @@ jobs:
           path: |
             .rustup
             .cargo
-          key: rust-${{ hashFiles('sources/scev-rs/rust-toolchain.toml') }}-zigbuild-v1
+          key: rust-${{ hashFiles('sources/scev-rs/rust-toolchain.toml') }}-v2
 
-      - name: Install Rust + cargo-zigbuild
+      - name: Install Rust
         if: steps.cache-rust.outputs.cache-hit != 'true'
         env:
           RUSTUP_HOME: ${{ github.workspace }}/.rustup
@@ -90,11 +62,6 @@ jobs:
           # First invocation in the workspace dir installs the pinned
           # toolchain + both musl targets per rust-toolchain.toml.
           (cd sources/scev-rs && rustc --version)
-          # cargo-zigbuild bridges cargo + zig-as-linker for cross-musl.
-          # `--locked` would need a Cargo.lock for the cargo-zigbuild
-          # crate itself, which we don't ship; rely on the cache key
-          # to avoid re-installs when nothing changed.
-          cargo install cargo-zigbuild --version '^0.20'
 
       - name: Verify Rust (cache hit)
         if: steps.cache-rust.outputs.cache-hit == 'true'
@@ -103,7 +70,6 @@ jobs:
           CARGO_HOME: ${{ github.workspace }}/.cargo
         run: |
           "$CARGO_HOME/bin/rustc" --version
-          "$CARGO_HOME/bin/cargo-zigbuild" --version
 
       - uses: jirutka/setup-alpine@v1
         with:
@@ -117,14 +83,10 @@ jobs:
           ABUILD_PRIVKEY: ${{ secrets.ABUILD_PRIVKEY }}
         run: |
           set -eu
-          # Zig (linker for cargo-zigbuild + the existing scev Zig
-          # build) and Rust both live in the bind-mounted workspace.
-          export PATH="$GITHUB_WORKSPACE/.zig:$GITHUB_WORKSPACE/.cargo/bin:$PATH"
+          export PATH="$GITHUB_WORKSPACE/.cargo/bin:$PATH"
           export RUSTUP_HOME="$GITHUB_WORKSPACE/.rustup"
           export CARGO_HOME="$GITHUB_WORKSPACE/.cargo"
-          zig version
-          rustc --version || true
-          cargo-zigbuild --version || true
+          rustc --version
 
           # abuild refuses to run as root — set up keys under the runner
           # user's HOME which setup-alpine drops us into.
@@ -178,15 +140,14 @@ jobs:
               # that abuild treats specially, plus blank entries.
               # awk-based filter: never exits non-zero on empty input,
               # which matters because the parent shell has set -e and
-              # `grep -v` returns 1 when its output is empty (the case
-              # for any package with no extra deps, e.g. the Zig one).
+              # `grep -v` returns 1 when its output is empty.
               filtered=$(echo "$deps" | tr ' ' '\n' | awk '/^[^!]./' | sort -u | tr '\n' ' ')
               if [ -n "$(echo "$filtered" | tr -d ' ')" ]; then
                 echo "+ sudo apk add $filtered"
                 # shellcheck disable=SC2086
                 sudo apk add --no-cache $filtered
               fi
-              CARCH="$CARCH" PATH="$GITHUB_WORKSPACE/.zig:$PATH" abuild -F
+              CARCH="$CARCH" abuild -F
             )
             echo "::endgroup::"
           done

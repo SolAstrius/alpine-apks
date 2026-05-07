@@ -6,27 +6,6 @@ on:
   pull_request:
 
 jobs:
-  zig-test:
-    name: zig build test (sources/scev)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      # mlugg/setup-zig@v1 still looks for the old `zig-linux-x86_64-*`
-      # tarball name; upstream switched to `zig-x86_64-linux-*` with
-      # 0.16.0. Fetch directly until the action catches up.
-      - name: Install Zig 0.16.0
-        env:
-          ZIG_VERSION: 0.16.0
-        run: |
-          set -euo pipefail
-          url="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
-          curl -fsSL "$url" | tar -xJ -C "$RUNNER_TEMP"
-          echo "$RUNNER_TEMP/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
-
-      - run: zig version && zig build test
-        working-directory: sources/scev
-
   cargo-test:
     name: cargo test (sources/scev-rs)
     runs-on: ubuntu-latest

@@ -59,25 +59,44 @@ jobs:
           CARGO_HOME: ${{ github.workspace }}/.cargo
         run: |
           set -euo pipefail
-          # `--default-host x86_64-unknown-linux-musl` is the load-bearing
-          # bit: the ubuntu-latest runner is glibc, but the alpine-sdk
-          # chroot the build step runs in is musl, and glibc rust
-          # binaries don't exec under a musl loader (no fallback;
-          # gcompat would patch around it but that's another moving
-          # part). Installing rustc itself as musl-static lets the same
-          # toolchain run in both contexts: we drive cargo from inside
-          # the chroot via APKBUILD, but the rustup metadata commands
-          # also need to work on the host before `setup-alpine`.
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- \
-                --default-toolchain none \
-                --default-host x86_64-unknown-linux-musl \
-                --profile minimal \
-                -y
+          # Why musl-host: the ubuntu-latest runner is glibc, but the
+          # alpine-sdk chroot the Build step runs in is musl, and glibc
+          # rust binaries don't exec under a musl loader. Installing
+          # rustc itself as musl-static lets the same toolchain run in
+          # both contexts.
+          #
+          # Why fetch the rustup-init binary directly instead of piping
+          # sh.rustup.rs: the install.sh wrapper detects the *runner's*
+          # host triple (glibc Ubuntu) and downloads a glibc rustup,
+          # ignoring `--default-host`. The wrapper's flag only sets the
+          # default toolchain triple — not the rustup binary's own
+          # triple. Pulling the musl rustup directly skips that dance.
+          #
+          # Why pin the toolchain explicitly here instead of letting
+          # rust-toolchain.toml auto-install: a previous run's
+          # leftover settings.toml under .rustup/ races with the new
+          # default-host setting and triggers a "command failed:
+          # 'rustc': No such file or directory" during the first
+          # rustup-managed proxy call. Nuking $RUSTUP_HOME first +
+          # passing --default-toolchain explicitly avoids the race.
+          rm -rf "$RUSTUP_HOME" "$CARGO_HOME"
+          curl --proto '=https' --tlsv1.2 -sSf \
+            -o /tmp/rustup-init \
+            https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-musl/rustup-init
+          chmod +x /tmp/rustup-init
+          /tmp/rustup-init -y \
+            --default-toolchain 1.85.0 \
+            --default-host x86_64-unknown-linux-musl \
+            --profile minimal \
+            --no-modify-path
+          rm /tmp/rustup-init
           export PATH="$CARGO_HOME/bin:$PATH"
-          # First invocation in the workspace dir installs the pinned
-          # toolchain + both musl targets per rust-toolchain.toml.
-          (cd sources/scev-rs && rustc --version)
+          # rust-toolchain.toml lists riscv64gc-unknown-linux-musl as
+          # an additional target — add it explicitly since we no longer
+          # rely on the toml's auto-install.
+          rustup target add riscv64gc-unknown-linux-musl
+          rustc --version
+          rustc --target riscv64gc-unknown-linux-musl --print sysroot
 
       - name: Verify Rust (cache hit)
         if: steps.cache-rust.outputs.cache-hit == 'true'

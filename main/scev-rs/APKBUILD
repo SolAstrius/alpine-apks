@@ -49,23 +49,33 @@ build() {
 		*) error "unsupported CARCH=$CARCH"; return 1 ;;
 	esac
 
-	# rust-lld lives in the toolchain sysroot, NOT $CARGO_HOME/bin —
-	# put it on PATH so cargo's `linker = "rust-lld"` finds it.
-	# (The .cargo/config.toml in the workspace handles the rest:
-	#  link-self-contained=yes, plus a libgcc_s.a → libunwind.a
-	#  linker-script trampoline for riscv64gc-musl's missing-library
-	#  wart.)
-	local sysroot host
-	sysroot=$(rustc --print sysroot)
-	host=$(rustc -vV | awk '/host:/ {print $2}')
-	export PATH="$sysroot/lib/rustlib/$host/bin:$PATH"
+	# Binaries are pre-built outside the chroot on the runner host —
+	# see release.yml's "Build rust binaries" step. The cargo target
+	# tree at $startdir/../../sources/scev-rs/target is visible inside
+	# the chroot via the GHA workspace bind-mount, so we just verify
+	# and copy.
+	#
+	# Why outside: glibc rustup binaries don't exec under the alpine
+	# musl loader, and cross-linking riscv64gc-musl with plain
+	# rust-lld + self-contained produces static-pie output that
+	# segfaults at execve on the live guest. The runner-side build
+	# uses cargo-zigbuild which produces binaries that work.
+	#
+	# Local-dev path: if you're invoking abuild on a Linux box that
+	# already has a cargo-zigbuild-produced binary tree (e.g. via
+	# `make build-rs` in the repo root), the same paths line up and
+	# this step is a no-op file copy. Otherwise it bails fast with a
+	# clear "run cargo zigbuild first" message.
+	local prebuilt="$startdir/../../sources/scev-rs/target/$cargo_target/release"
+	if [ ! -x "$prebuilt/scev" ] || [ ! -x "$prebuilt/scevd" ]; then
+		error "pre-built binaries missing at $prebuilt"
+		error "run: cd sources/scev-rs && cargo zigbuild --release --target $cargo_target --workspace"
+		return 1
+	fi
 
-	cargo build --release --target "$cargo_target" --workspace --locked
-
-	# Stash binaries where package() functions can find them.
 	mkdir -p "$builddir/_dist"
-	cp "target/$cargo_target/release/scev"  "$builddir/_dist/"
-	cp "target/$cargo_target/release/scevd" "$builddir/_dist/"
+	cp "$prebuilt/scev"  "$builddir/_dist/"
+	cp "$prebuilt/scevd" "$builddir/_dist/"
 }
 
 package() {

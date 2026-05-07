@@ -26,85 +26,63 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Rust toolchain for the workspace at sources/scev-rs.
-      # RUSTUP_HOME and CARGO_HOME live inside $GITHUB_WORKSPACE so the
-      # alpine chroot (which bind-mounts the workspace) can exec them;
-      # the chroot's build step prepends $CARGO_HOME/bin to PATH.
+      # Build the rust binaries OUTSIDE the alpine chroot, on the
+      # ubuntu-latest runner directly. Two reasons:
       #
-      # Cross-compilation: we use `rust-lld` (the bundled LLVM linker
-      # rustup ships under each toolchain's sysroot) plus
-      # `-Clink-self-contained=yes` to pull in rust's own musl libc and
-      # crt artefacts. That's enough to build a static-musl binary for
-      # both x86_64 and riscv64gc without any external linker, gcc
-      # cross-toolchain, or zig install.
+      #  1. rust toolchains from rustup are glibc-targeted by default;
+      #     glibc binaries don't exec under a musl loader (which is
+      #     what the alpine-sdk chroot the Build step runs in is). The
+      #     musl-static rustup distribution that would solve this
+      #     turns out to be flaky during install (rustc itself is
+      #     static-pie musl and rustup's post-install verify call
+      #     fails to read its version on the glibc host).
       #
-      # Cache key bumps with rust-toolchain.toml — touching the pinned
-      # channel forces a re-install.
-      - name: Cache Rust toolchain
-        id: cache-rust
+      #  2. Cross-linking riscv64gc-unknown-linux-musl with plain
+      #     rust-lld + link-self-contained=yes produces a static-pie
+      #     binary that segfaults at execve on the live alpine guest
+      #     (kernel/musl loader incompatibility). cargo-zigbuild
+      #     produces working binaries on the same host. So we install
+      #     zig + cargo-zigbuild here and let zig's linker handle the
+      #     cross-musl shape.
+      #
+      # The chroot then only does packaging (abuild) — no rust /
+      # zig / linker invocation happens inside the chroot at all,
+      # which avoids the whole glibc/musl exec mess.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.85.0'
+          targets: x86_64-unknown-linux-musl,riscv64gc-unknown-linux-musl
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: '0.16.0'
+
+      - name: Cache cargo-zigbuild
+        id: cache-zigbuild
         uses: actions/cache@v4
         with:
-          path: |
-            .rustup
-            .cargo
-          # Bump the suffix when the install shape changes (host
-          # triple, default-host, profile, …) so old caches don't
-          # poison new runs.
-          key: rust-musl-${{ hashFiles('sources/scev-rs/rust-toolchain.toml') }}-v3
+          path: ~/.cargo/bin/cargo-zigbuild
+          key: cargo-zigbuild-0.20-${{ runner.os }}
 
-      - name: Install Rust (musl host)
-        if: steps.cache-rust.outputs.cache-hit != 'true'
+      - name: Install cargo-zigbuild
+        if: steps.cache-zigbuild.outputs.cache-hit != 'true'
+        run: cargo install cargo-zigbuild --version '^0.20' --locked
+
+      - name: Build rust binaries
         env:
-          RUSTUP_HOME: ${{ github.workspace }}/.rustup
-          CARGO_HOME: ${{ github.workspace }}/.cargo
+          CARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
-          # Why musl-host: the ubuntu-latest runner is glibc, but the
-          # alpine-sdk chroot the Build step runs in is musl, and glibc
-          # rust binaries don't exec under a musl loader. Installing
-          # rustc itself as musl-static lets the same toolchain run in
-          # both contexts.
-          #
-          # Why fetch the rustup-init binary directly instead of piping
-          # sh.rustup.rs: the install.sh wrapper detects the *runner's*
-          # host triple (glibc Ubuntu) and downloads a glibc rustup,
-          # ignoring `--default-host`. The wrapper's flag only sets the
-          # default toolchain triple — not the rustup binary's own
-          # triple. Pulling the musl rustup directly skips that dance.
-          #
-          # Why pin the toolchain explicitly here instead of letting
-          # rust-toolchain.toml auto-install: a previous run's
-          # leftover settings.toml under .rustup/ races with the new
-          # default-host setting and triggers a "command failed:
-          # 'rustc': No such file or directory" during the first
-          # rustup-managed proxy call. Nuking $RUSTUP_HOME first +
-          # passing --default-toolchain explicitly avoids the race.
-          rm -rf "$RUSTUP_HOME" "$CARGO_HOME"
-          curl --proto '=https' --tlsv1.2 -sSf \
-            -o /tmp/rustup-init \
-            https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-musl/rustup-init
-          chmod +x /tmp/rustup-init
-          /tmp/rustup-init -y \
-            --default-toolchain 1.85.0 \
-            --default-host x86_64-unknown-linux-musl \
-            --profile minimal \
-            --no-modify-path
-          rm /tmp/rustup-init
-          export PATH="$CARGO_HOME/bin:$PATH"
-          # rust-toolchain.toml lists riscv64gc-unknown-linux-musl as
-          # an additional target — add it explicitly since we no longer
-          # rely on the toml's auto-install.
-          rustup target add riscv64gc-unknown-linux-musl
-          rustc --version
-          rustc --target riscv64gc-unknown-linux-musl --print sysroot
-
-      - name: Verify Rust (cache hit)
-        if: steps.cache-rust.outputs.cache-hit == 'true'
-        env:
-          RUSTUP_HOME: ${{ github.workspace }}/.rustup
-          CARGO_HOME: ${{ github.workspace }}/.cargo
-        run: |
-          "$CARGO_HOME/bin/rustc" --version
+          case "$CARCH" in
+            x86_64)  target=x86_64-unknown-linux-musl     ;;
+            riscv64) target=riscv64gc-unknown-linux-musl  ;;
+            *) echo "unsupported CARCH=$CARCH" >&2; exit 1 ;;
+          esac
+          cd sources/scev-rs
+          cargo zigbuild --release --target "$target" --workspace --locked
+          # Sanity print so the apk Build step can resolve the path
+          # via $GITHUB_WORKSPACE bind-mount inside the chroot.
+          ls -la "target/$target/release/scev" "target/$target/release/scevd"
 
       - uses: jirutka/setup-alpine@v1
         with:
@@ -118,10 +96,6 @@ jobs:
           ABUILD_PRIVKEY: ${{ secrets.ABUILD_PRIVKEY }}
         run: |
           set -eu
-          export PATH="$GITHUB_WORKSPACE/.cargo/bin:$PATH"
-          export RUSTUP_HOME="$GITHUB_WORKSPACE/.rustup"
-          export CARGO_HOME="$GITHUB_WORKSPACE/.cargo"
-          rustc --version
 
           # abuild refuses to run as root — set up keys under the runner
           # user's HOME which setup-alpine drops us into.

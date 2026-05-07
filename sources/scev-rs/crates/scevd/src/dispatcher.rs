@@ -148,7 +148,7 @@ async fn handle_from_client(
             let _ = tx
                 .send(Frame::Response {
                     id: 0,
-                    err: Some("scevd: serial writer offline".into()),
+                    err: Some(scev_wire::ErrorInfo::generic("scevd: serial writer offline")),
                     result: scev_wire::Value::Nil,
                 })
                 .await;
@@ -175,6 +175,45 @@ async fn handle_from_serial(
             if let Some(tx) = clients.get(&client_id) {
                 if let Err(e) = tx.send(rewritten).await {
                     debug!(client = client_id, error = %e, "client gone before response delivery");
+                }
+            }
+        }
+        Frame::Chunked {
+            response_id,
+            stream_id,
+            total_size,
+        } => {
+            // Mark the original request as "still pending until the
+            // chunked drain finishes" — we don't remove the entry,
+            // because the read_chunk follow-ups are issued by the
+            // client itself (using the daemon's id space for those
+            // new requests, allocated normally) and the original
+            // pending slot is what the client's reader task is
+            // waiting on. The client recognises the marker, drains,
+            // and resolves locally; the daemon never sees a Response
+            // for `response_id` because the original handler invocation
+            // on the host completed when it emitted the Chunked frame.
+            //
+            // What we DO need: rewrite the daemon-side response_id
+            // back to the client's local id, and forward.
+            let Some(&(client_id, local_id)) = pending.get(&response_id) else {
+                debug!(
+                    daemon_id = response_id,
+                    stream_id, "stray chunked marker (no pending entry)",
+                );
+                return;
+            };
+            // The original request slot is consumed — the client's
+            // pending entry will be cleared by its drain finishing.
+            pending.remove(&response_id);
+            let rewritten = Frame::Chunked {
+                response_id: local_id,
+                stream_id,
+                total_size,
+            };
+            if let Some(tx) = clients.get(&client_id) {
+                if let Err(e) = tx.send(rewritten).await {
+                    debug!(client = client_id, error = %e, "client gone before chunked marker delivery");
                 }
             }
         }

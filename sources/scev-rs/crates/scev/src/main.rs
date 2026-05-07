@@ -163,7 +163,7 @@ fn args(values: Vec<Value>) -> Value {
 async fn call(client: &Client, method: &str, args: Value, ms: u64) -> Result<Value> {
     let timeout = Duration::from_millis(ms);
     client.call(method, args, timeout).await.map_err(|e| match e {
-        CallError::Rpc(s) => anyhow!("rpc returned error: {s}"),
+        CallError::Rpc(info) => anyhow!("rpc returned error [{}]: {}", info.code, info.message),
         CallError::Timeout => anyhow!("rpc timed out"),
         CallError::Disconnected => anyhow!("rpc client disconnected"),
         CallError::Io(s) => anyhow!("io: {s}"),

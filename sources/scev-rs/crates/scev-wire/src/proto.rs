@@ -11,6 +11,12 @@ pub enum Tag {
     Request = 0,
     Response = 1,
     Event = 2,
+    /// Sent by the host in lieu of a Response whose encoded form would
+    /// exceed the wire frame cap. Wire shape:
+    /// `[3, response_id, stream_id, total_size]`. The receiver fetches
+    /// `total_size` bytes via `read_chunk(stream_id, ...)` calls and
+    /// decodes the assembled buffer as a regular Response.
+    Chunked = 3,
 }
 
 impl Tag {
@@ -19,6 +25,7 @@ impl Tag {
             0 => Some(Tag::Request),
             1 => Some(Tag::Response),
             2 => Some(Tag::Event),
+            3 => Some(Tag::Chunked),
             _ => None,
         }
     }
@@ -41,4 +48,26 @@ pub mod methods {
     pub const TYPE: &str = "type";
     pub const TRACE: &str = "trace";
     pub const SELF_: &str = "self";
+    /// Pull a slice of a chunked response cached on the host. Args:
+    /// `(stream_id: int, offset: int, max_len: int) -> bin`.
+    pub const READ_CHUNK: &str = "read_chunk";
+    /// Discard a chunked response early. Args: `(stream_id: int) -> bool`.
+    pub const DISCARD_CHUNK: &str = "discard_chunk";
+}
+
+/// Stable string codes the host emits in the structured error map.
+/// Mirrors `lekkit.scev.core.rpc.RpcErrors`. Treat unknown codes as
+/// [GENERIC] for branching purposes; always show [`ErrorInfo::message`]
+/// to the user regardless.
+pub mod errors {
+    pub const GENERIC: &str = "rpc_error";
+    pub const BAD_ARGS: &str = "bad_args";
+    pub const NO_SUCH_METHOD: &str = "no_such_method";
+    pub const NO_SUCH_PEER: &str = "no_such_peer";
+    pub const LUA_ERROR: &str = "lua_error";
+    pub const RUNTIME_ERROR: &str = "runtime_error";
+    pub const INTERNAL_ERROR: &str = "internal_error";
+    pub const NOT_INSTALLED: &str = "not_installed";
+    pub const UNSUPPORTED: &str = "unsupported";
+    pub const FRAME_TOO_LARGE: &str = "frame_too_large";
 }

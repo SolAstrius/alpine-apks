@@ -28,8 +28,8 @@ pub mod proto;
 pub mod tokio_codec;
 
 pub use codec::{decode_frame, encode_frame, FrameCodecError, MAX_FRAME};
-pub use frame::{Frame, RpcError};
-pub use proto::{methods, Tag};
+pub use frame::{ErrorInfo, Frame, RpcError};
+pub use proto::{errors, methods, Tag};
 pub use tokio_codec::{CodecError, FrameCodec};
 
 // Re-export rmpv so downstream crates can build/inspect Values without

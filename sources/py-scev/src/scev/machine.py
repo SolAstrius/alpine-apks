@@ -76,6 +76,11 @@ class Machine:
         # Endpoint resolution (incl. SCEV_ENDPOINT / SCEV_SERIAL fallback)
         # lives in `_endpoint.discover` — passing None lets it pick.
         self._client = _rpc.Client.open(endpoint)
+        # Capability handshake — best-effort. Gates batch/cancel/
+        # subscribe-by-name on the host's advertised flags. If the
+        # host is too old to answer `self`, an empty Caps means every
+        # gated feature falls back to its unconditional path.
+        self._client.handshake()
         self._peripheral_cache: dict[str, Peripheral] = {}
         # Class cache keyed by tuple-of-types — five identical
         # peripherals share the synthesized class; only the bound name
@@ -176,6 +181,51 @@ class Machine:
         through to msgpack and converted to Lua types by the host."""
         self._client.call(_rpc.METHOD_QUEUE_EVENT, [name, *args], timeout=5.0)
 
+    @property
+    def caps(self) -> _rpc.Caps:
+        """Host capability snapshot from the handshake. Branch on
+        `m.caps.has("batch")` etc. before invoking optional surface."""
+        return self._client.caps
+
+    def has_capability(self, name: str) -> bool:
+        return self._client.has_capability(name)
+
+    def subscribe(self, *names: str) -> Any:
+        """Allow-list event names server-side. Empty `names` is
+        wildcard / "send everything". Returns the host's filter
+        echo (or no-op result on legacy hosts)."""
+        return self._client.subscribe(*names)
+
+    def unsubscribe(self, *names: str) -> Any:
+        """Drop event names from the server-side filter. Empty
+        `names` drops the whole filter (no events)."""
+        return self._client.unsubscribe(*names)
+
+    def batch(
+        self,
+        items: list[tuple[str, list[Any]]],
+        *,
+        stop_on_error: bool = False,
+        timeout: float = 60.0,
+    ) -> list[tuple[_rpc.RpcError | None, Any]]:
+        """Ordered batch dispatch. Each item is `(method, args_list)`.
+        Returns one `(error_or_None, result)` tuple per item, in input
+        order. With `stop_on_error=True`, items after the first
+        failure surface with `e.code == ERR_SKIPPED`."""
+        return self._client.batch(items, stop_on_error=stop_on_error, timeout=timeout)
+
+    def batch_par(
+        self,
+        items: list[tuple[str, list[Any]]],
+        *,
+        timeout: float = 60.0,
+    ) -> list[tuple[_rpc.RpcError | None, Any]]:
+        """Parallel batch dispatch — same envelope shape as `batch`,
+        items run concurrently on the host. Useful for fan-out reads
+        (`describe`, `inventory.list`) where round-trip count would
+        otherwise dominate."""
+        return self._client.batch_par(items, timeout=timeout)
+
     def call(self, peer: str, method: str, *args: Any, timeout: float = 15.0) -> Any:
         """Raw `peripheral.call`. Most users should index by name and
         invoke methods on the Peripheral proxy instead — that route
@@ -214,16 +264,24 @@ class Machine:
         entry so the host can start any per-machine event pump it
         wants. Errors on subscribe are tolerated — the host's default
         handler is a no-op anyway."""
-        if subscribe:
-            try:
-                self._client.call(_rpc.METHOD_SUBSCRIBE, timeout=3.0)
-            except _rpc.RpcError:
-                pass
         wanted = (
             None
             if filter is None
             else (filter,) if isinstance(filter, str) else tuple(filter)
         )
+        if subscribe:
+            try:
+                # When the host advertises server-side filtering,
+                # pass our allow-list through so unwanted events are
+                # dropped before they cross the wire. Wildcard (empty
+                # names) on legacy hosts behaves identically to the
+                # bare-args call we used to make.
+                if wanted is not None and self._client.has_capability("event_subscriptions"):
+                    self._client.subscribe(*wanted)
+                else:
+                    self._client.subscribe()
+            except _rpc.RpcError:
+                pass
         i = 0
         while count is None or i < count:
             name, args = self._client.recv_event(timeout=timeout)

@@ -34,6 +34,7 @@ import select
 import socket
 import termios
 import time
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import msgpack
@@ -122,6 +123,80 @@ class ProtocolError(Exception):
     """Frame structure was wrong (wrong arity, missing fields, …)."""
 
 
+@dataclass(frozen=True, slots=True)
+class Caps:
+    """Snapshot of `self.protocol_version` / `self.capabilities` /
+    `self.limits` returned by [`Client.handshake`][]. Stored once on
+    the client and read from every gating site.
+
+    Pre-bump hosts (no `protocol_version` field) get a default Caps
+    with `protocol_version=0` and an empty capability set, so every
+    gated feature stays disabled and the client falls back to the
+    unconditional path."""
+
+    protocol_version: int = 0
+    capabilities: frozenset[str] = field(default_factory=frozenset)
+    frame_max_bytes: int = 0
+
+    def has(self, name: str) -> bool:
+        return name in self.capabilities
+
+
+def _parse_caps(v: Any) -> Caps:
+    """Decode the `self` RPC response into a [`Caps`][]. Tolerates the
+    legacy host (no protocol_version / capabilities / limits keys)
+    by returning an empty Caps so callers' `has(...)` checks always
+    return False."""
+    if not isinstance(v, dict):
+        return Caps()
+    pv_raw = v.get("protocol_version")
+    pv = int(pv_raw) if isinstance(pv_raw, (int, float)) else 0
+    caps_raw = v.get("capabilities") or {}
+    caps_set: set[str] = set()
+    if isinstance(caps_raw, dict):
+        for k, val in caps_raw.items():
+            if isinstance(k, str) and bool(val):
+                caps_set.add(k)
+    limits = v.get("limits") or {}
+    fmb = 0
+    if isinstance(limits, dict):
+        raw = limits.get("frame_max_bytes")
+        if isinstance(raw, (int, float)):
+            fmb = int(raw)
+    return Caps(protocol_version=pv, capabilities=frozenset(caps_set), frame_max_bytes=fmb)
+
+
+def _parse_batch_envelope(v: Any) -> list[tuple[Optional[RpcError], Any]]:
+    """`batch`/`batch_par` return an array of `[err_or_nil, result]`
+    pairs. Convert each pair to a `(RpcError | None, result)` tuple
+    so callers can iterate naturally. Items the host marked
+    [`ERR_SKIPPED`][] surface as RpcError instances with that code —
+    same shape as a real error, so callers can branch on `e.code`."""
+    if not isinstance(v, (list, tuple)):
+        return []
+    out: list[tuple[Optional[RpcError], Any]] = []
+    for entry in v:
+        if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+            out.append((RpcError("batch item shape wrong", code=ERR_GENERIC), None))
+            continue
+        err_slot, result = entry[0], entry[1]
+        if err_slot is None:
+            out.append((None, result))
+        elif isinstance(err_slot, dict):
+            code = err_slot.get("code") or ERR_GENERIC
+            message = err_slot.get("message") or ""
+            if not isinstance(code, str):
+                code = str(code)
+            if not isinstance(message, str):
+                message = str(message)
+            out.append((RpcError(message, code=code), None))
+        elif isinstance(err_slot, str):
+            out.append((RpcError(err_slot, code=ERR_GENERIC), None))
+        else:
+            out.append((RpcError("batch err slot wrong shape", code=ERR_GENERIC), None))
+    return out
+
+
 def _unwrap_response(err: Any, result: Any) -> Any:
     """Resolve a (err, result) pair from a TAG_RESPONSE frame.
 
@@ -166,6 +241,9 @@ class Client:
         # Distinguishes serial (line-discipline + spurious 0-byte
         # reads) from unix/tcp (real EOF on 0-byte read).
         self._transport = transport
+        # Filled by [`handshake`][]; default Caps means every gated
+        # feature stays disabled (legacy host).
+        self._caps: Caps = Caps()
         if transport == "serial":
             self._set_raw()
             self._flush_first_run()
@@ -346,35 +424,51 @@ class Client:
         self._next_id += 1
         self.send_request(rid, method, args)
         deadline = None if timeout is None else time.monotonic() + timeout
-        while True:
-            payload = self.recv_frame(deadline)
-            try:
-                arr = msgpack.unpackb(payload, raw=False, strict_map_key=False)
-            except Exception:
-                continue
-            if not isinstance(arr, (list, tuple)) or not arr:
-                continue
-            tag = arr[0]
-            if tag == TAG_CHUNKED:
-                # [TAG_CHUNKED, response_id, stream_id, total_size]
-                if len(arr) != 4:
-                    raise ProtocolError(f"chunked arity {len(arr)}")
-                if arr[1] != rid:
-                    # Marker for someone else's call — drop. (Shouldn't
-                    # happen against the host because call() is
-                    # serial, but tolerant.)
+        try:
+            while True:
+                payload = self.recv_frame(deadline)
+                try:
+                    arr = msgpack.unpackb(payload, raw=False, strict_map_key=False)
+                except Exception:
                     continue
-                return self._drain_chunked(arr[2], arr[3], deadline)
-            if tag != TAG_RESPONSE:
-                # Event or malformed — keep waiting.
-                continue
-            if len(arr) != 4:
-                raise ProtocolError(f"response arity {len(arr)}")
-            if arr[1] != rid:
-                # Stale response from a previous call — drop and keep
-                # waiting for ours.
-                continue
-            return _unwrap_response(arr[2], arr[3])
+                if not isinstance(arr, (list, tuple)) or not arr:
+                    continue
+                tag = arr[0]
+                if tag == TAG_CHUNKED:
+                    # [TAG_CHUNKED, response_id, stream_id, total_size]
+                    if len(arr) != 4:
+                        raise ProtocolError(f"chunked arity {len(arr)}")
+                    if arr[1] != rid:
+                        # Marker for someone else's call — drop. (Shouldn't
+                        # happen against the host because call() is
+                        # serial, but tolerant.)
+                        continue
+                    return self._drain_chunked(arr[2], arr[3], deadline)
+                if tag != TAG_RESPONSE:
+                    # Event or malformed — keep waiting.
+                    continue
+                if len(arr) != 4:
+                    raise ProtocolError(f"response arity {len(arr)}")
+                if arr[1] != rid:
+                    # Stale response from a previous call — drop and keep
+                    # waiting for ours.
+                    continue
+                return _unwrap_response(arr[2], arr[3])
+        except Timeout:
+            # Best-effort cancel: the host's coroutine is still
+            # running on its end. Push the request frame straight onto
+            # the wire (no response correlation needed; the host's
+            # eventual reply lands as a stray Response that recv_event
+            # / future call() invocations silently drop). Gated on the
+            # capability flag so older hosts don't see a spurious
+            # `no_such_method`.
+            if self._caps.has("cancel"):
+                try:
+                    self.send_request(self._next_id, METHOD_CANCEL, [rid])
+                    self._next_id += 1
+                except Exception:
+                    pass
+            raise
 
     def _drain_chunked(
         self,
@@ -386,45 +480,161 @@ class Client:
         `read_chunk` calls, decode the assembled buffer as a
         Response, and return the unwrapped result. Raises `RpcError`
         if the host responded with one — same exception shape as a
-        non-chunked call, so callers can't tell the difference."""
+        non-chunked call, so callers can't tell the difference.
+
+        Any failure mid-drain (RpcError from read_chunk, timeout,
+        decode error, short payload) fires a best-effort
+        `discard_chunk(stream_id)` so the host frees the slab cache
+        immediately rather than waiting for the TTL to evict it."""
         buf = bytearray()
         offset = 0
         # Keep slices well under MAX_FRAME so the read_chunk Response
         # (a `bin` payload of slice_len bytes plus msgpack/cobs
         # overhead) always fits in one wire frame.
         slice_size = min(MAX_FRAME // 2, 32 * 1024)
-        while offset < total_size:
-            want = min(slice_size, total_size - offset)
-            remaining = (
-                None if deadline is None else max(0.0, deadline - time.monotonic())
-            )
-            slice_bytes = self.call(
-                METHOD_READ_CHUNK,
-                [stream_id, offset, want],
-                timeout=remaining,
-            )
-            if not isinstance(slice_bytes, (bytes, bytearray)):
-                raise ProtocolError(
-                    f"read_chunk returned non-bytes: {type(slice_bytes).__name__}"
-                )
-            if not slice_bytes:
-                raise ProtocolError(
-                    f"chunked drain hit EOF at {offset}/{total_size}"
-                )
-            buf.extend(slice_bytes)
-            offset += len(slice_bytes)
-        # Assembled bytes are exactly the original Response frame.
         try:
-            arr = msgpack.unpackb(bytes(buf), raw=False, strict_map_key=False)
-        except Exception as e:
-            raise ProtocolError(f"chunked drain: assembled buffer didn't decode: {e}")
-        if (
-            not isinstance(arr, (list, tuple))
-            or len(arr) != 4
-            or arr[0] != TAG_RESPONSE
-        ):
-            raise ProtocolError(f"chunked drain: not a Response: {arr!r}")
-        return _unwrap_response(arr[2], arr[3])
+            while offset < total_size:
+                want = min(slice_size, total_size - offset)
+                remaining = (
+                    None if deadline is None else max(0.0, deadline - time.monotonic())
+                )
+                try:
+                    slice_bytes = self.call(
+                        METHOD_READ_CHUNK,
+                        [stream_id, offset, want],
+                        timeout=remaining,
+                    )
+                except RpcError:
+                    # Host-side error (NO_SUCH_PEER for an evicted /
+                    # expired stream, etc.). The stream is already gone
+                    # from the host's perspective — no point sending a
+                    # discard. Re-raise.
+                    raise
+                if not isinstance(slice_bytes, (bytes, bytearray)):
+                    raise ProtocolError(
+                        f"read_chunk returned non-bytes: {type(slice_bytes).__name__}"
+                    )
+                if not slice_bytes:
+                    raise ProtocolError(
+                        f"chunked drain hit EOF at {offset}/{total_size}"
+                    )
+                buf.extend(slice_bytes)
+                offset += len(slice_bytes)
+            # Assembled bytes are exactly the original Response frame.
+            try:
+                arr = msgpack.unpackb(bytes(buf), raw=False, strict_map_key=False)
+            except Exception as e:
+                raise ProtocolError(f"chunked drain: assembled buffer didn't decode: {e}")
+            if (
+                not isinstance(arr, (list, tuple))
+                or len(arr) != 4
+                or arr[0] != TAG_RESPONSE
+            ):
+                raise ProtocolError(f"chunked drain: not a Response: {arr!r}")
+            return _unwrap_response(arr[2], arr[3])
+        except RpcError:
+            raise
+        except (Timeout, ProtocolError, FrameTooLarge, OSError):
+            # Local abort — host still has the slab cached. Push a
+            # best-effort discard frame on the way out.
+            self._discard_chunk_fire_and_forget(stream_id)
+            raise
+
+    def _discard_chunk_fire_and_forget(self, stream_id: int) -> None:
+        """Send `discard_chunk(stream_id)` without waiting for the
+        response. Used on chunked-drain abort paths so we don't block
+        error reporting on a cleanup round-trip."""
+        try:
+            self.send_request(self._next_id, METHOD_DISCARD_CHUNK, [stream_id])
+            self._next_id += 1
+        except Exception:
+            # Best-effort — if the wire is gone, the host's TTL will
+            # eventually reclaim the slab on its own.
+            pass
+
+    # ---------------------------------------------------------- handshake
+
+    @property
+    def caps(self) -> Caps:
+        return self._caps
+
+    def has_capability(self, name: str) -> bool:
+        return self._caps.has(name)
+
+    @property
+    def protocol_version(self) -> int:
+        return self._caps.protocol_version
+
+    def handshake(self, *, timeout: float = 3.0) -> Caps:
+        """Round-trip `self` once and stash protocol_version /
+        capabilities / limits. Idempotent — second call replaces the
+        snapshot. Best-effort: any error (very old host, transient
+        wire issue) yields a default Caps so subsequent gating sites
+        return `has(...) == False` and the client falls back to the
+        unconditional path."""
+        try:
+            v = self.call(METHOD_SELF, timeout=timeout)
+            self._caps = _parse_caps(v)
+        except Exception:
+            self._caps = Caps()
+        return self._caps
+
+    # ---------------------------------------------------------- subscribe
+
+    def subscribe(self, *names: str, timeout: float = 3.0) -> Any:
+        """Subscribe to events. Empty `names` is the wildcard / pre-
+        handshake "send everything" mode; on hosts advertising
+        `event_subscriptions` it also clears any prior allow-list.
+        Returns the host's `{filter: nil | [name,…]}` echo so callers
+        can confirm what stuck."""
+        args: list[Any] = [list(names)] if names else []
+        return self.call(METHOD_SUBSCRIBE, args, timeout=timeout)
+
+    def unsubscribe(self, *names: str, timeout: float = 3.0) -> Any:
+        """Drop event names from the server-side filter. Empty
+        `names` drops the entire filter (no events delivered)."""
+        args: list[Any] = [list(names)] if names else []
+        return self.call(METHOD_UNSUBSCRIBE, args, timeout=timeout)
+
+    # ---------------------------------------------------------- batch
+
+    def batch(
+        self,
+        items: list[tuple[str, list[Any]]],
+        *,
+        stop_on_error: bool = False,
+        timeout: float = 60.0,
+    ) -> list[tuple[Optional[RpcError], Any]]:
+        """Ordered batch dispatch. Each item is `(method, args_list)`.
+        Returns one `(RpcError | None, result)` tuple per input item,
+        in input order. With `stop_on_error=True`, items after the
+        first error surface with `code=ERR_SKIPPED`."""
+        return self._batch_inner(METHOD_BATCH, items, stop_on_error, timeout)
+
+    def batch_par(
+        self,
+        items: list[tuple[str, list[Any]]],
+        *,
+        timeout: float = 60.0,
+    ) -> list[tuple[Optional[RpcError], Any]]:
+        """Parallel batch dispatch — same envelope shape as [`batch`][],
+        items run concurrently on the host. `stop_on_error` doesn't
+        apply (host always runs every item)."""
+        return self._batch_inner(METHOD_BATCH_PAR, items, False, timeout)
+
+    def _batch_inner(
+        self,
+        method: str,
+        items: list[tuple[str, list[Any]]],
+        stop_on_error: bool,
+        timeout: float,
+    ) -> list[tuple[Optional[RpcError], Any]]:
+        wire_items = [[m, list(a)] for m, a in items]
+        args: list[Any] = [wire_items]
+        if method == METHOD_BATCH and stop_on_error:
+            args.append({"stop_on_error": True})
+        v = self.call(method, args, timeout=timeout)
+        return _parse_batch_envelope(v)
 
     def recv_event(self, timeout: Optional[float] = None) -> tuple[str, list]:
         """Block until the next TAG_EVENT frame and return (name, args).

@@ -194,6 +194,96 @@ def _cmd_describe(m: Machine, rest: list[str]) -> int:
     return 0
 
 
+def _cmd_subscribe(m: Machine, rest: list[str]) -> int:
+    """Allow-list event names server-side. Empty `rest` resubscribes
+    to wildcard / "send everything"."""
+    _dump_json(m.subscribe(*rest))
+    return 0
+
+
+def _cmd_unsubscribe(m: Machine, rest: list[str]) -> int:
+    """Drop names from the server-side filter. Empty `rest` drops
+    the entire filter (no events)."""
+    _dump_json(m.unsubscribe(*rest))
+    return 0
+
+
+def _cmd_cancel(m: Machine, rest: list[str]) -> int:
+    if len(rest) < 1:
+        return _err(f"usage: {PROG} cancel <id>")
+    try:
+        target_id = int(rest[0])
+    except ValueError:
+        return _err(f"cancel: bad id '{rest[0]}'")
+    if not m.has_capability("cancel"):
+        sys.stderr.write(f"{PROG}: warning: host did not advertise `cancel` capability\n")
+    _dump_json(m.client.call(_rpc.METHOD_CANCEL, [target_id], timeout=3.0))
+    return 0
+
+
+def _cmd_batch(m: Machine, rest: list[str]) -> int:
+    return _cmd_batch_inner(m, rest, parallel=False)
+
+
+def _cmd_batch_par(m: Machine, rest: list[str]) -> int:
+    return _cmd_batch_inner(m, rest, parallel=True)
+
+
+def _cmd_batch_inner(m: Machine, rest: list[str], *, parallel: bool) -> int:
+    """`batch` / `batch-par` accept JSON `[[method, [args...]], ...]`
+    via --items <json> or stdin. Output is one JSON envelope per line:
+    `{"err": null|{code,message}, "result": ...}`. Exit 2 if any item
+    errored."""
+    stop_on_error = False
+    items_json: str | None = None
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if tok == "--items" and i + 1 < len(rest):
+            items_json = rest[i + 1]
+            i += 2
+        elif tok == "--stop-on-error":
+            stop_on_error = True
+            i += 1
+        else:
+            return _err(f"batch: unexpected arg '{tok}'")
+    if items_json is None:
+        items_json = sys.stdin.read()
+    try:
+        parsed = json.loads(items_json)
+    except json.JSONDecodeError as e:
+        return _err(f"batch: bad JSON: {e}")
+    if not isinstance(parsed, list):
+        return _err("batch: --items must be a JSON array")
+    items: list[tuple[str, list[Any]]] = []
+    for entry in parsed:
+        if not isinstance(entry, list) or not entry or not isinstance(entry[0], str):
+            return _err(f"batch: each item must be [method, [args...]]; got {entry!r}")
+        method = entry[0]
+        args = entry[1] if len(entry) > 1 and isinstance(entry[1], list) else []
+        items.append((method, list(args)))
+    cap = "batch_par" if parallel else "batch"
+    if not m.has_capability(cap):
+        sys.stderr.write(f"{PROG}: warning: host did not advertise `{cap}` capability\n")
+    if parallel:
+        results = m.batch_par(items)
+    else:
+        results = m.batch(items, stop_on_error=stop_on_error)
+    any_err = False
+    for err, result in results:
+        if err is None:
+            envelope = {"err": None, "result": result}
+        else:
+            any_err = True
+            envelope = {
+                "err": {"code": err.code, "message": err.message},
+                "result": None,
+            }
+        sys.stdout.write(json.dumps(envelope, default=str, ensure_ascii=False))
+        sys.stdout.write("\n")
+    return 2 if any_err else 0
+
+
 def _cmd_find(m: Machine, rest: list[str]) -> int:
     if len(rest) < 1:
         return _err(f"usage: {PROG} find <type>")
@@ -244,6 +334,11 @@ _COMMANDS: list[tuple[str, Any, str]] = [
     ("events", _cmd_events, "subscribe and print events"),
     ("schema", _cmd_schema, "observed event-argument shapes"),
     ("trace", _cmd_trace, "dispatch-trace control"),
+    ("subscribe", _cmd_subscribe, "allow-list event names server-side"),
+    ("unsubscribe", _cmd_unsubscribe, "drop event names from server filter"),
+    ("batch", _cmd_batch, "ordered batch dispatch (--items JSON / stdin)"),
+    ("batch-par", _cmd_batch_par, "parallel batch dispatch (--items JSON / stdin)"),
+    ("cancel", _cmd_cancel, "cancel an in-flight host request by id"),
 ]
 
 

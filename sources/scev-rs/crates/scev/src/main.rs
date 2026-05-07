@@ -96,6 +96,40 @@ enum Cmd {
         #[arg(default_value_t = 5000)]
         timeout_ms: i64,
     },
+    /// Ordered batch dispatch — items are JSON `[[method, [args...]], ...]`.
+    /// Reads from --items flag or stdin if absent. Result prints one
+    /// JSON envelope per line.
+    Batch {
+        /// JSON array of `[method, [args...]]` pairs. If omitted, read
+        /// from stdin.
+        #[arg(long)]
+        items: Option<String>,
+        /// Stop dispatching after the first item that errors. Items
+        /// after the failure surface as `skipped` envelopes.
+        #[arg(long)]
+        stop_on_error: bool,
+    },
+    /// Parallel batch dispatch — same JSON shape as `batch`. Cross-peripheral
+    /// items run concurrently on the host.
+    #[command(name = "batch-par")]
+    BatchPar {
+        #[arg(long)]
+        items: Option<String>,
+    },
+    /// Subscribe to a server-side event-name allow-list. Empty list
+    /// resubscribes to wildcard (every event).
+    Subscribe {
+        #[arg(trailing_var_arg = true)]
+        names: Vec<String>,
+    },
+    /// Drop event names from the server-side filter. Empty list drops
+    /// the entire filter (no events).
+    Unsubscribe {
+        #[arg(trailing_var_arg = true)]
+        names: Vec<String>,
+    },
+    /// Cancel an in-flight request by id (best-effort).
+    Cancel { id: u64 },
 }
 
 fn main() -> Result<()> {
@@ -122,6 +156,12 @@ async fn run(cli: Cli) -> Result<i32> {
     let (read, write) = connect(&endpoint).await?;
     let client = Client::start(read, write);
 
+    // Capability handshake — best-effort, fills in defaults if the
+    // host is too old (or down) to answer `self`. Subsequent gating
+    // (subscribe-by-name, batch, cancel-on-timeout) reads from the
+    // stashed Caps without further round-trips.
+    let _ = client.handshake().await;
+
     match cli.cmd {
         Cmd::Ping => cmd_ping(&client).await,
         Cmd::Log { level, msg } => cmd_log(&client, &level, &msg.join(" ")).await,
@@ -147,6 +187,11 @@ async fn run(cli: Cli) -> Result<i32> {
             count,
             timeout_ms,
         } => cmd_modem_call(&client, &modem, target_ch, reply_ch, &message, count, timeout_ms).await,
+        Cmd::Batch { items, stop_on_error } => cmd_batch(&client, items.as_deref(), stop_on_error, false).await,
+        Cmd::BatchPar { items } => cmd_batch(&client, items.as_deref(), false, true).await,
+        Cmd::Subscribe { names } => cmd_subscribe(&client, &names, false).await,
+        Cmd::Unsubscribe { names } => cmd_subscribe(&client, &names, true).await,
+        Cmd::Cancel { id } => cmd_cancel(&client, id).await,
     }
 }
 
@@ -316,10 +361,10 @@ async fn cmd_queue(client: &Client, event: &str, tokens: &[String]) -> Result<i3
 }
 
 async fn cmd_events(client: &Client, count: Option<i64>) -> Result<i32> {
-    // Best-effort subscribe — host's handler is a no-op stub today, but
-    // the daemon broadcasts events to every connected client regardless,
-    // so this is mostly here for forward compat.
-    let _ = call(client, methods::SUBSCRIBE, empty(), 3000).await;
+    // Best-effort subscribe — wildcard, since the user said "show me
+    // everything". With `event_subscriptions` capable hosts, an empty
+    // names list means the wildcard fast path; older hosts no-op.
+    let _ = client.subscribe(&[]).await;
     let mut rx = client.events();
     let mut printed = 0i64;
     let max = count.unwrap_or(-1);
@@ -389,6 +434,10 @@ async fn cmd_modem_call(
     // Subscribe to events BEFORE issuing the call so we don't race the
     // host's reply. With the daemon, events broadcast continuously to
     // every client, so this is purely a local broadcast::Receiver.
+    // Narrow the server-side filter to modem traffic so unrelated
+    // events aren't carried over the wire — this is the whole point
+    // of the `event_subscriptions` capability.
+    let _ = client.subscribe(&["modem_message", "rednet_message"]).await;
     let mut events = client.events();
 
     // open + transmit. With the daemon, `call` round-trips through the
@@ -436,5 +485,117 @@ async fn cmd_modem_call(
             Err(_) => return Ok(if printed > 0 { 0 } else { 124 }),
         }
     }
+    Ok(0)
+}
+
+async fn cmd_batch(
+    client: &Client,
+    items_arg: Option<&str>,
+    stop_on_error: bool,
+    parallel: bool,
+) -> Result<i32> {
+    let cap = if parallel { "batch_par" } else { "batch" };
+    if !client.has_capability(cap) {
+        eprintln!(
+            "scev: warning: host did not advertise `{cap}` capability — proceeding anyway, \
+             but it may surface as no_such_method"
+        );
+    }
+    let raw = match items_arg {
+        Some(s) => s.to_string(),
+        None => {
+            use std::io::Read;
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .context("read items from stdin")?;
+            buf
+        }
+    };
+    let parsed: serde_json::Value =
+        serde_json::from_str(&raw).context("parse --items as JSON")?;
+    let arr = parsed
+        .as_array()
+        .ok_or_else(|| anyhow!("--items must be a JSON array"))?;
+    let mut items: Vec<(String, Value)> = Vec::with_capacity(arr.len());
+    for entry in arr {
+        let pair = entry
+            .as_array()
+            .ok_or_else(|| anyhow!("each item must be a [method, args] pair"))?;
+        if pair.is_empty() {
+            bail!("item is empty");
+        }
+        let method = pair[0]
+            .as_str()
+            .ok_or_else(|| anyhow!("item method must be a string"))?
+            .to_string();
+        let args_v = if pair.len() > 1 {
+            args::json_to_msgpack(pair[1].clone())
+        } else {
+            Value::Array(vec![])
+        };
+        items.push((method, args_v));
+    }
+    let results = if parallel {
+        client.batch_par(items).await
+    } else {
+        client.batch(items, stop_on_error).await
+    };
+    let results = results.map_err(|e| match e {
+        CallError::Rpc(info) => anyhow!("rpc returned error [{}]: {}", info.code, info.message),
+        CallError::Timeout => anyhow!("rpc timed out"),
+        CallError::Disconnected => anyhow!("rpc client disconnected"),
+        CallError::Io(s) => anyhow!("io: {s}"),
+    })?;
+    // Print one JSON envelope per line: {"err": null|{code,message}, "result": ...}
+    let mut any_errored = false;
+    for r in &results {
+        let envelope = match r {
+            Ok(v) => serde_json::json!({
+                "err": serde_json::Value::Null,
+                "result": args::msgpack_to_json(v),
+            }),
+            Err(info) => {
+                any_errored = true;
+                serde_json::json!({
+                    "err": {"code": info.code, "message": info.message},
+                    "result": serde_json::Value::Null,
+                })
+            }
+        };
+        println!("{}", serde_json::to_string(&envelope)?);
+    }
+    Ok(if any_errored { 2 } else { 0 })
+}
+
+async fn cmd_subscribe(client: &Client, names: &[String], unsubscribe: bool) -> Result<i32> {
+    let owned: Vec<&str> = names.iter().map(String::as_str).collect();
+    let resp = if unsubscribe {
+        client.unsubscribe(&owned).await
+    } else {
+        client.subscribe(&owned).await
+    }
+    .map_err(|e| match e {
+        CallError::Rpc(info) => anyhow!("rpc returned error [{}]: {}", info.code, info.message),
+        CallError::Timeout => anyhow!("rpc timed out"),
+        CallError::Disconnected => anyhow!("rpc client disconnected"),
+        CallError::Io(s) => anyhow!("io: {s}"),
+    })?;
+    args::dump_json(&resp);
+    Ok(0)
+}
+
+async fn cmd_cancel(client: &Client, id: u64) -> Result<i32> {
+    if !client.has_capability("cancel") {
+        eprintln!("scev: warning: host did not advertise `cancel` capability");
+    }
+    let v = call(
+        client,
+        methods::CANCEL,
+        args(vec![Value::Integer(id.into())]),
+        3000,
+    )
+    .await?;
+    args::dump_json(&v);
     Ok(0)
 }

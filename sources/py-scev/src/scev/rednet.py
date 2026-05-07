@@ -245,7 +245,18 @@ class Rednet:
         if given. Discards messages we sent ourselves (sender ==
         our id)."""
         try:
-            self._machine._client.call("subscribe", timeout=3.0)  # noqa: SLF001
+            # Narrow the server-side filter to the two events rednet
+            # actually cares about — saves bandwidth on hosts
+            # advertising `event_subscriptions`. Legacy hosts treat
+            # the names as advisory and forward everything anyway, so
+            # the client-side `filter=` tuple in pull_event still
+            # protects us.
+            if self._machine._client.has_capability("event_subscriptions"):  # noqa: SLF001
+                self._machine._client.subscribe(  # noqa: SLF001
+                    "rednet_message", "modem_message"
+                )
+            else:
+                self._machine._client.subscribe()  # noqa: SLF001
         except Exception:
             pass
 

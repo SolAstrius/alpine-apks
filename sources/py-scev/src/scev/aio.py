@@ -76,6 +76,9 @@ class AsyncClient:
         # Distinguishes serial (line-discipline + spurious 0-byte
         # reads from VMIN/VTIME=0) from unix/tcp (real EOF on 0-byte).
         self._transport = transport
+        # Filled by [`handshake`][]; default Caps means every gated
+        # feature stays disabled (legacy host).
+        self._caps: _rpc.Caps = _rpc.Caps()
         self._pending: dict[int, asyncio.Future[Any]] = {}
         # Each AsyncEventStream registers a queue here; the dispatcher
         # fans each TAG_EVENT frame out to all of them. Using bounded
@@ -333,7 +336,41 @@ class AsyncClient:
             return await asyncio.wait_for(fut, timeout)
         except asyncio.TimeoutError as e:
             self._pending.pop(rid, None)
+            # Best-effort cancel: the host's coroutine is still
+            # running on its end. Push a fire-and-forget CANCEL frame
+            # — we don't register a pending entry for the cancel
+            # itself, so the host's eventual reply lands in the
+            # dispatcher and gets dropped. Gated on the capability
+            # flag so legacy hosts don't see a spurious
+            # `no_such_method`.
+            if self._caps.has("cancel"):
+                self._fire_and_forget(_rpc.METHOD_CANCEL, [rid])
             raise _rpc.Timeout from e
+
+    def _fire_and_forget(self, method: str, args: list[Any]) -> None:
+        """Push a request frame onto the wire without registering a
+        pending future. Used by cancel / discard_chunk on abort
+        paths — the host's eventual response is silently dropped by
+        the dispatcher because there's no pending entry to resolve.
+        Errors swallowed: this is best-effort cleanup."""
+        try:
+            rid = self._next_id
+            self._next_id += 1
+            payload = msgpack.packb(
+                [_rpc.TAG_REQUEST, rid, method, list(args)],
+                use_bin_type=True,
+            )
+            if len(payload) > MAX_FRAME:
+                return
+            encoded = _cobs.encode(payload)
+            try:
+                os.write(self.fd, encoded)
+            except (BlockingIOError, OSError):
+                # Wire backpressured or gone — the host's TTL will
+                # eventually reclaim whatever we were trying to free.
+                pass
+        except Exception:
+            pass
 
     # ----------------------------------------------------------- chunked
 
@@ -371,10 +408,17 @@ class AsyncClient:
                 buf.extend(slice_bytes)
                 offset += len(slice_bytes)
         except _rpc.RpcError as e:
+            # Host-side error (e.g. NO_SUCH_PEER on an evicted
+            # stream) — slab is already gone host-side; no point
+            # discarding.
             if not original.done():
                 original.set_exception(e)
             return
         except Exception as e:  # noqa: BLE001 — surface anything as a clean error
+            # Local abort (timeout, decode, network blip). Push a
+            # fire-and-forget discard_chunk so the host frees the
+            # slab now instead of waiting for TTL eviction.
+            self._fire_and_forget(_rpc.METHOD_DISCARD_CHUNK, [stream_id])
             if not original.done():
                 original.set_exception(
                     _rpc.RpcError(f"chunked drain failed: {e}", code=_rpc.ERR_GENERIC)
@@ -412,6 +456,89 @@ class AsyncClient:
             return
         if not original.done():
             original.set_result(resolved)
+
+    # ----------------------------------------------------------- handshake
+
+    @property
+    def caps(self) -> _rpc.Caps:
+        return self._caps
+
+    def has_capability(self, name: str) -> bool:
+        return self._caps.has(name)
+
+    @property
+    def protocol_version(self) -> int:
+        return self._caps.protocol_version
+
+    async def handshake(self, *, timeout: float = 3.0) -> _rpc.Caps:
+        """Round-trip `self` once and stash protocol_version /
+        capabilities / limits. Idempotent — second call replaces the
+        snapshot. Best-effort: any error yields a default Caps so
+        gating sites return False."""
+        try:
+            v = await self.call(_rpc.METHOD_SELF, timeout=timeout)
+            self._caps = _rpc._parse_caps(v)
+        except Exception:
+            self._caps = _rpc.Caps()
+        return self._caps
+
+    # ----------------------------------------------------------- subscribe
+
+    async def subscribe(
+        self,
+        *names: str,
+        timeout: float = 3.0,
+    ) -> Any:
+        """Subscribe to events. Empty `names` is wildcard / "send
+        everything". Returns the host's `{filter: nil | [name,…]}`
+        echo so callers can verify."""
+        args: list[Any] = [list(names)] if names else []
+        return await self.call(_rpc.METHOD_SUBSCRIBE, args, timeout=timeout)
+
+    async def unsubscribe(
+        self,
+        *names: str,
+        timeout: float = 3.0,
+    ) -> Any:
+        """Drop event names from the server-side filter. Empty
+        `names` drops the entire filter (no events delivered)."""
+        args: list[Any] = [list(names)] if names else []
+        return await self.call(_rpc.METHOD_UNSUBSCRIBE, args, timeout=timeout)
+
+    # ----------------------------------------------------------- batch
+
+    async def batch(
+        self,
+        items: list[tuple[str, list[Any]]],
+        *,
+        stop_on_error: bool = False,
+        timeout: float = 60.0,
+    ) -> list[tuple[Optional[_rpc.RpcError], Any]]:
+        """Ordered batch dispatch. See [`scev._rpc.Client.batch`][]."""
+        return await self._batch_inner(_rpc.METHOD_BATCH, items, stop_on_error, timeout)
+
+    async def batch_par(
+        self,
+        items: list[tuple[str, list[Any]]],
+        *,
+        timeout: float = 60.0,
+    ) -> list[tuple[Optional[_rpc.RpcError], Any]]:
+        """Parallel batch dispatch. See [`scev._rpc.Client.batch_par`][]."""
+        return await self._batch_inner(_rpc.METHOD_BATCH_PAR, items, False, timeout)
+
+    async def _batch_inner(
+        self,
+        method: str,
+        items: list[tuple[str, list[Any]]],
+        stop_on_error: bool,
+        timeout: float,
+    ) -> list[tuple[Optional[_rpc.RpcError], Any]]:
+        wire_items = [[m, list(a)] for m, a in items]
+        args: list[Any] = [wire_items]
+        if method == _rpc.METHOD_BATCH and stop_on_error:
+            args.append({"stop_on_error": True})
+        v = await self.call(method, args, timeout=timeout)
+        return _rpc._parse_batch_envelope(v)
 
     # ----------------------------------------------------------- events
 
@@ -584,9 +711,46 @@ class AsyncMachine:
         discover. Accepts a URI string (`unix:///path`,
         `tcp://host:port`, `serial:///dev/...`), a pre-built
         [Endpoint][scev._endpoint.Endpoint], or None for default
-        discovery (SCEV_ENDPOINT > /run/scevd.sock > /dev/ttyS1)."""
+        discovery (SCEV_ENDPOINT > /run/scevd.sock > /dev/ttyS1).
+
+        Runs the capability handshake before returning so subsequent
+        `m.caps.has("batch")` etc. queries reflect the host's
+        advertised feature set."""
         client = await AsyncClient.open(endpoint)
+        # Best-effort handshake; default Caps on any error.
+        await client.handshake()
         return cls(client, endpoint)
+
+    @property
+    def caps(self) -> _rpc.Caps:
+        """Host capability snapshot from the handshake."""
+        return self._client.caps
+
+    def has_capability(self, name: str) -> bool:
+        return self._client.has_capability(name)
+
+    async def subscribe(self, *names: str) -> Any:
+        return await self._client.subscribe(*names)
+
+    async def unsubscribe(self, *names: str) -> Any:
+        return await self._client.unsubscribe(*names)
+
+    async def batch(
+        self,
+        items: list[tuple[str, list[Any]]],
+        *,
+        stop_on_error: bool = False,
+        timeout: float = 60.0,
+    ) -> list[tuple[Optional[_rpc.RpcError], Any]]:
+        return await self._client.batch(items, stop_on_error=stop_on_error, timeout=timeout)
+
+    async def batch_par(
+        self,
+        items: list[tuple[str, list[Any]]],
+        *,
+        timeout: float = 60.0,
+    ) -> list[tuple[Optional[_rpc.RpcError], Any]]:
+        return await self._client.batch_par(items, timeout=timeout)
 
     async def close(self) -> None:
         await self._client.close()
@@ -746,16 +910,21 @@ class AsyncMachine:
         all see every event (the dispatcher fans out to per-iterator
         queues). `max_buffer` bounds each queue — overflow drops the
         oldest event."""
-        if subscribe:
-            try:
-                await self._client.call(_rpc.METHOD_SUBSCRIBE, timeout=3.0)
-            except _rpc.RpcError:
-                pass
         wanted = (
             None
             if filter is None
             else (filter,) if isinstance(filter, str) else tuple(filter)
         )
+        if subscribe:
+            try:
+                if wanted is not None and self._client.has_capability(
+                    "event_subscriptions"
+                ):
+                    await self._client.subscribe(*wanted)
+                else:
+                    await self._client.subscribe()
+            except _rpc.RpcError:
+                pass
         q = self._client.subscribe_events(max_buffer=max_buffer)
         try:
             i = 0
@@ -977,7 +1146,12 @@ class AsyncRednet:
         from .rednet import RednetMessage as RednetMessageS
 
         try:
-            await self._machine._client.call("subscribe", timeout=3.0)  # noqa: SLF001
+            if self._machine._client.has_capability("event_subscriptions"):  # noqa: SLF001
+                await self._machine._client.subscribe(  # noqa: SLF001
+                    "rednet_message", "modem_message"
+                )
+            else:
+                await self._machine._client.subscribe()  # noqa: SLF001
         except Exception:
             pass
 

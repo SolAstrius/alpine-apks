@@ -98,6 +98,8 @@ def _render_doc(sig: dict) -> str:
         if enum:
             s += " ∈ {" + "|".join(enum) + "}"
         bits.append(s)
+    if sig.get("varargs"):
+        bits.append("*args")
     parts.append(", ".join(bits))
     parts.append(")")
     ret = sig.get("return", "value")
@@ -148,6 +150,20 @@ def _make_method(sig: dict) -> Any:
                 annotation=_lua_to_py(p),
             )
         )
+    # Variadic methods — the host flags `varargs: true` for any
+    # `@LuaFunction` whose Java signature takes `IArguments` (the CC
+    # equivalent of Python's `*args`). We can't see the per-position
+    # types in that case, but we can at least let callers pass
+    # positional args through without `Signature.bind` rejecting them.
+    is_variadic = bool(sig.get("varargs"))
+    if is_variadic:
+        inspect_params.append(
+            inspect.Parameter(
+                "args",
+                inspect.Parameter.VAR_POSITIONAL,
+                annotation=Any,
+            )
+        )
     sigobj = inspect.Signature(
         inspect_params,
         return_annotation=_ret_to_py(sig.get("return", "value")),
@@ -157,14 +173,24 @@ def _make_method(sig: dict) -> Any:
     def fn(self: Peripheral, *args: Any, **kwargs: Any) -> Any:
         bound = sigobj.bind(self, *args, **kwargs)
         bound.apply_defaults()
-        # Strip self; drop trailing Nones the user didn't pass — Lua
-        # treats them as `nil`/missing and the host's reflective
-        # converter would coerce them back to nil anyway, so we save
-        # bytes on the wire and avoid surprising peripherals that
-        # check arg count.
-        positional = list(bound.arguments.values())[1:]
-        while positional and positional[-1] is None:
-            positional.pop()
+        # Walk the signature in declaration order, splitting explicit
+        # params from any *args bucket. Explicit-trailing-None trimming
+        # only applies when there are no real varargs to follow — Nones
+        # the user explicitly threaded between varargs are load-bearing
+        # (Lua-side `nil` placeholders) and must not be dropped.
+        explicit: list[Any] = []
+        varargs: list[Any] = []
+        for nm, param in sigobj.parameters.items():
+            if nm == "self":
+                continue
+            if param.kind is inspect.Parameter.VAR_POSITIONAL:
+                varargs.extend(bound.arguments.get(nm, ()) or ())
+            else:
+                explicit.append(bound.arguments.get(nm))
+        if not varargs:
+            while explicit and explicit[-1] is None:
+                explicit.pop()
+        positional = explicit + varargs
         return self._machine._client.call(  # noqa: SLF001
             "call", [self._name, method_name, *positional], timeout=15.0
         )
